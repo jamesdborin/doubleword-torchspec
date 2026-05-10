@@ -32,8 +32,8 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.ops.flex_attention import (
-    compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
+    eagle3_block_mask,
     generate_eagle3_mask,
 )
 from torchspec.utils.distributed import get_sp_ring_group, get_sp_ulysses_group
@@ -940,9 +940,7 @@ def _build_eagle3_mask_pair(
         raise ValueError(f"Unknown eagle3 mask mode {mode!r}")
 
     # Always build a flex-compatible mask_mod for block-sparse iteration.
-    seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
     mask_mod_flex = generate_eagle3_mask(
-        seq_lengths=seq_lengths,
         Q_LEN=q_len,
         KV_LEN=kv_len,
         lck=lck,
@@ -1409,31 +1407,15 @@ class LlamaFlexAttention(LlamaAttention):
             key_cache = key_states
             value_cache = value_states
 
-        seq_lengths = attention_mask.sum(dim=-1)
-        # Shrink the attention mask to align with the padding to the right.
-        # This is equivalent to the shrinking logic in eagle3.py
-        seq_lengths -= lck
-        # TODO: Remove the usage of uncompiled create_block_mask after
-        # https://github.com/pytorch/pytorch/issues/160018
-        if q_len <= 128:
-            create_block_mask_func = create_block_mask
-            flex_attention_func = flex_attention
-        else:
-            create_block_mask_func = compile_friendly_create_block_mask
-            flex_attention_func = compile_friendly_flex_attention
+        flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
-        block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths,
-                Q_LEN=q_len,
-                KV_LEN=key_cache.shape[-2],
-                lck=lck,
-            ),
-            B=bsz,
-            H=1,  # Rely on broadcast
+        block_mask = eagle3_block_mask(
             Q_LEN=q_len,
             KV_LEN=key_cache.shape[-2],
+            B=bsz,
+            H=1,  # Rely on broadcast
             device=query_states.device,
+            lck=lck,
         )
         attn_output = flex_attention_func(
             query=query_states,
