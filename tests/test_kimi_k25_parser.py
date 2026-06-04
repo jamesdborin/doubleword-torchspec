@@ -564,3 +564,139 @@ class TestKimiK25ParserToolCalls:
 
         assert loss_mask.sum() > 0
         assert isinstance(input_ids, torch.Tensor)
+
+
+class TestKimiK25ThinkRecovery:
+    def test_recovers_missing_open_think(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "What is flash attention"},
+            {"role": "assistant", "content": "let me think</think>It is fast attention."},
+        ]
+        formatted = parser.format(conversation)
+        assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+        assert "<think></think>" not in assistant
+        assert assistant.count("<think>") == 1
+        assert assistant.count("</think>") == 1
+        assert assistant.startswith("<think>let me think</think>It is fast attention.")
+
+    def test_plain_answer_still_gets_empty_think(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+        ]
+        formatted = parser.format(conversation)
+        assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+        assert assistant.startswith("<think></think>Hello!")
+
+    def test_wellformed_think_unchanged(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "<think>reason</think>answer"},
+        ]
+        formatted = parser.format(conversation)
+        assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+        assert assistant.count("<think>") == 1
+        assert assistant.startswith("<think>reason</think>answer")
+
+
+class TestThinkBalanceCheck:
+    def test_flags_dropped_open_think(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+
+        assert has_unbalanced_thinking_tags("<think></think>reasoning</think>answer") is True
+
+    def test_wellformed_think_ok(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+
+        assert has_unbalanced_thinking_tags("<think>reasoning</think>answer") is False
+
+    def test_plain_empty_think_ok(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+
+        assert has_unbalanced_thinking_tags("<think></think>plain answer") is False
+
+    def test_no_think_ok(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+
+        assert has_unbalanced_thinking_tags("just an answer") is False
+
+    def test_catches_unfixed_parser_output(self, mock_tokenizer, kimi_template):
+        from torchspec.data.parse import KimiK25Parser, has_unbalanced_thinking_tags
+
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "reasoning</think>answer"},
+        ]
+        formatted = parser.format(conv)
+        assert has_unbalanced_thinking_tags(formatted) is False
+
+
+class TestKimiK25ReasoningField:
+    def _asst(self, parser, conv):
+        return parser.format(conv).split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+
+    @pytest.mark.parametrize("field", ["reasoning_content", "thinking", "reasoning"])
+    def test_reasoning_field_reconstructed(self, mock_tokenizer, kimi_template, field):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "the answer", field: "the reasoning"},
+        ]
+        a = self._asst(parser, conv)
+        assert a.startswith("<think>the reasoning</think>the answer")
+        assert "<think></think>" not in a
+        assert a.count("<think>") == 1 and a.count("</think>") == 1
+
+    def test_inline_think_not_double_wrapped(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "<think>r</think>a", "reasoning_content": "r"},
+        ]
+        a = self._asst(parser, conv)
+        assert a.count("<think>") == 1
+        assert a.startswith("<think>r</think>a")
+
+    def test_plain_answer_no_field_unchanged(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "answer"}]
+        a = self._asst(parser, conv)
+        assert a.startswith("<think></think>answer")
+
+    def test_non_last_turn_reasoning_field_stripped(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
+        ]
+        formatted = parser.format(conv)
+        first = formatted.split("<|im_assistant|>assistant<|im_middle|>")[1]
+        last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
+        assert "r1" not in first and first.startswith("<think></think>a1")
+        assert last.startswith("<think>r2</think>a2")
+
+
+class TestKimiK25MultiTurnDroppedOpener:
+    def test_non_last_dropped_opener_stripped(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "r1</think>a1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "r2</think>a2"},
+        ]
+        formatted = parser.format(conv)
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+
+        assert has_unbalanced_thinking_tags(formatted) is False
+        first = formatted.split("<|im_assistant|>assistant<|im_middle|>")[1]
+        last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
+        assert first.startswith("<think></think>a1")
+        assert "r1" not in first
+        assert last.startswith("<think>r2</think>a2")

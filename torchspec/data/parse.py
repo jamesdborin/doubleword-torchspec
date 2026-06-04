@@ -41,16 +41,22 @@ __all__ = [
     "MiniMaxParser",
     "create_parser",
     "has_thinking_content",
+    "has_unbalanced_thinking_tags",
 ]
 
 _HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
 
 
+def _has_dropped_think_opener(content: str) -> bool:
+    return "</think>" in content and not content.lstrip().startswith("<think>")
+
+
 def has_thinking_content(conversation: list) -> bool:
     """Detect whether any assistant message contains real thinking content.
 
-    Checks for non-empty <think> blocks in message content and for
-    separate thinking/thinking_content/reasoning_content/reasoning fields
+    Checks for non-empty <think> blocks in message content (including the
+    dropped-opener ``{reasoning}</think>{answer}`` shape that recovery restores)
+    and for separate thinking/thinking_content/reasoning_content/reasoning fields
     on the message dict (covers preserved_thinking outputs from engines).
     Must be called on the raw conversation BEFORE formatting, since
     formatters (e.g. KimiK25Parser) inject empty <think></think> tags.
@@ -59,12 +65,18 @@ def has_thinking_content(conversation: list) -> bool:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")
-        if isinstance(content, str) and _HAS_THINKING_RE.search(content):
+        if isinstance(content, str) and (
+            _HAS_THINKING_RE.search(content) or _has_dropped_think_opener(content)
+        ):
             return True
         for field in ("thinking", "thinking_content", "reasoning_content", "reasoning"):
             if msg.get(field):
                 return True
     return False
+
+
+def has_unbalanced_thinking_tags(formatted_text: str) -> bool:
+    return formatted_text.count("<think>") != formatted_text.count("</think>")
 
 
 class Parser(ABC):
@@ -404,6 +416,29 @@ class KimiK25Parser(Parser):
     def _strip_thinking(self, content: str) -> str:
         return self.THINK_PATTERN.sub("", content)
 
+    @staticmethod
+    def _recover_missing_think_open(content: str) -> str:
+        if _has_dropped_think_opener(content):
+            return "<think>" + content
+        return content
+
+    _REASONING_FIELDS = ("thinking", "thinking_content", "reasoning_content", "reasoning")
+
+    @classmethod
+    def _reasoning_from_field(cls, msg: dict) -> str:
+        for field in cls._REASONING_FIELDS:
+            value = msg.get(field)
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _merge_reasoning_field(cls, msg: dict, content: str) -> str:
+        reasoning = cls._reasoning_from_field(msg)
+        if reasoning and "<think>" not in content and "</think>" not in content:
+            return f"<think>{reasoning}</think>{content}"
+        return content
+
     def _format_tool_calls(self, tool_calls: list) -> str:
         """Format structured tool_calls into Kimi-native inline tokens."""
         tc_parts = []
@@ -418,14 +453,7 @@ class KimiK25Parser(Parser):
         return self.TOOL_CALLS_SECTION_BEGIN + "".join(tc_parts) + self.TOOL_CALLS_SECTION_END
 
     def format(self, conversation: "Conversation", **kwargs) -> str:
-        """Build conversation string with Kimi-K2.5 tokens.
-
-        Strips <think>...</think> from all assistant turns except the last one,
-        aligned with Kimi's native multi-turn behavior.
-
-        When expand_media_tokens=False, image placeholders are kept as-is so
-        that sglang's multimodal processor can match them against image_data.
-        """
+        """Build conversation string with Kimi-K2.5 tokens."""
         add_generation_prompt = kwargs.pop("add_generation_prompt", False)
         expand_media_tokens = kwargs.pop("expand_media_tokens", True)
         parts = []
@@ -458,6 +486,7 @@ class KimiK25Parser(Parser):
                     content = self._format_content(content, role)
 
             if role == "assistant" and idx != last_assistant_idx:
+                content = self._recover_missing_think_open(content)
                 content = self._strip_thinking(content)
 
             if role == "system":
@@ -468,6 +497,9 @@ class KimiK25Parser(Parser):
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
                     content += self._format_tool_calls(tool_calls)
+                if idx == last_assistant_idx:
+                    content = self._merge_reasoning_field(msg, content)
+                    content = self._recover_missing_think_open(content)
                 if not content.startswith("<think>"):
                     content = "<think></think>" + content
                 parts.append(f"{self.ASSISTANT_HEADER}{content}{self.END_TOKEN}")
