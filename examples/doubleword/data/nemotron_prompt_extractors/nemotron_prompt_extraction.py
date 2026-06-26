@@ -17,11 +17,32 @@ from typing import Any
 
 DEFAULT_CONFIG = "default"
 IFBENCH_MARKERS = ("ifbench", "if_bench", "instruction_following")
+INITIAL_CONTEXT_ROLES = {"system", "developer"}
 
 
 DATASET_SPECS: dict[str, dict[str, Any]] = {
     "nvidia/Nemotron-RL-Instruction-Following-Structured-Outputs-v2": {
         "priority": ["responses_input"],
+        "data_files": [
+            {
+                "config": DEFAULT_CONFIG,
+                "split": "direct_generation",
+                "path": "direct_generation/train-00000-of-00001.parquet",
+                "format": "parquet",
+            },
+            {
+                "config": DEFAULT_CONFIG,
+                "split": "diversified_tasks",
+                "path": "diversified_tasks/train-00000-of-00001.parquet",
+                "format": "parquet",
+            },
+            {
+                "config": DEFAULT_CONFIG,
+                "split": "tool_calling_extraction",
+                "path": "tool_calling_extraction/train-00000-of-00001.parquet",
+                "format": "parquet",
+            },
+        ],
     },
     "nvidia/Nemotron-RL-Instruction-Following-Citation-Formatting-v1": {
         "priority": ["responses_input"],
@@ -281,6 +302,17 @@ def is_message(value: Any) -> bool:
     return isinstance(value, dict) and ("role" in value or "content" in value)
 
 
+def normalize_tools(tools: Any) -> Any:
+    tools = parse_jsonish(tools)
+    if tools is None:
+        return None
+    if isinstance(tools, list) and not tools:
+        return None
+    if isinstance(tools, dict) and not tools:
+        return None
+    return tools
+
+
 def first_message_prompt(messages: Any) -> tuple[str | None, str | None]:
     messages = parse_jsonish(messages)
     if not isinstance(messages, list):
@@ -290,7 +322,9 @@ def first_message_prompt(messages: Any) -> tuple[str | None, str | None]:
     for message in flattened:
         role = str(message.get("role", "")).lower()
         if role == "user":
-            return content_to_text(message.get("content")), "first_user_message"
+            text = content_to_text(message.get("content"))
+            if text and text.strip():
+                return text, "first_user_message"
 
     for message in flattened:
         role = str(message.get("role", "")).lower()
@@ -321,11 +355,63 @@ def flatten_messages(value: Any) -> list[dict[str, Any]]:
     return flattened
 
 
+def initial_system_prompt(messages: Any) -> str | None:
+    messages = parse_jsonish(messages)
+    if not isinstance(messages, list):
+        return None
+
+    parts: list[str] = []
+    for message in flatten_messages(messages):
+        role = str(message.get("role", "")).lower()
+        if role in INITIAL_CONTEXT_ROLES:
+            text = content_to_text(message.get("content"))
+            if text and text.strip():
+                parts.append(text)
+            continue
+        if role in {"assistant", "tool", "function"}:
+            break
+        if role == "user":
+            break
+    return "\n\n".join(parts) if parts else None
+
+
 def responses_input(row: dict[str, Any]) -> Any:
     params = parse_jsonish(row.get("responses_create_params"))
     if not isinstance(params, dict):
         return None
     return params.get("input")
+
+
+def responses_tools(row: dict[str, Any]) -> Any:
+    params = parse_jsonish(row.get("responses_create_params"))
+    if not isinstance(params, dict):
+        return None
+    return params.get("tools")
+
+
+def extract_tools_for_source(row: dict[str, Any], source: str | None) -> tuple[Any, str | None]:
+    if source == "responses_input":
+        tools = normalize_tools(responses_tools(row))
+        return tools, "responses_create_params.tools" if tools is not None else None
+    if source in {"messages", "nested_messages"}:
+        tools = normalize_tools(row.get("tools"))
+        return tools, "tools" if tools is not None else None
+    return None, None
+
+
+def extract_system_for_source(
+    row: dict[str, Any], source: str | None
+) -> tuple[str | None, str | None]:
+    if source == "responses_input":
+        system_prompt = initial_system_prompt(responses_input(row))
+        return (
+            system_prompt,
+            "responses_create_params.input" if system_prompt is not None else None,
+        )
+    if source in {"messages", "nested_messages"}:
+        system_prompt = initial_system_prompt(row.get("messages"))
+        return system_prompt, "messages" if system_prompt is not None else None
+    return None, None
 
 
 def is_ifbench_row(row: dict[str, Any], config: str | None = None) -> bool:
@@ -362,6 +448,12 @@ def extract_prompt(
             return prompt, source, detail
 
     return None, None, "no_prompt_found"
+
+
+def extract_dataset_metadata(row: dict[str, Any], dataset_id: str) -> dict[str, Any]:
+    if dataset_id == "nvidia/Nemotron-RL-Instruction-Following-Structured-Outputs-v2":
+        return {"schema_str": row.get("schema_str")}
+    return {}
 
 
 def dataset_configs(dataset_id: str, requested_config: str | None) -> list[str | None]:
@@ -501,10 +593,30 @@ def load_jsonl_file(dataset_id: str, path: str) -> Iterable[dict[str, Any]]:
             yield decoder.decode(buffer)
 
 
+def load_parquet_file(dataset_id: str, path: str) -> Iterable[dict[str, Any]]:
+    try:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "PyArrow and Hugging Face Hub are required to read Parquet files."
+        ) from exc
+
+    local_path = hf_hub_download(repo_id=dataset_id, repo_type="dataset", filename=path)
+    parquet_file = pq.ParquetFile(local_path)
+    for batch in parquet_file.iter_batches(batch_size=2048):
+        yield from batch.to_pylist()
+
+
 def download_jsonl_file(
     dataset_id: str, path: str, requests: Any, hf_hub_url: Any
 ) -> Path:
-    cache_root = Path("/tmp/nemotron_prompt_full_extraction/hf_jsonl_cache")
+    cache_root = Path(
+        os.environ.get(
+            "NEMOTRON_PROMPT_JSONL_CACHE",
+            "/tmp/nemotron_prompt_full_extraction/hf_jsonl_cache",
+        )
+    )
     local_path = cache_root / dataset_id.replace("/", "__") / path
     parts_dir = local_path.with_suffix(local_path.suffix + ".parts")
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -585,7 +697,9 @@ def write_prompts(
                 (
                     data_file["config"],
                     data_file["split"],
-                    load_jsonl_file(dataset_id, data_file["path"]),
+                    load_parquet_file(dataset_id, data_file["path"])
+                    if data_file.get("format") == "parquet"
+                    else load_jsonl_file(dataset_id, data_file["path"]),
                 )
                 for data_file in data_files
             )
@@ -601,8 +715,12 @@ def write_prompts(
                     error = None
                     try:
                         prompt, source, source_detail = extract_prompt(row, dataset_id, config)
+                        tools, tools_source = extract_tools_for_source(row, source)
+                        system_prompt, system_source = extract_system_for_source(row, source)
                     except Exception as exc:
                         prompt, source, source_detail = None, None, None
+                        tools, tools_source = None, None
+                        system_prompt, system_source = None, None
                         error = f"{type(exc).__name__}: {exc}"
 
                     record = {
@@ -613,7 +731,12 @@ def write_prompts(
                         "prompt": prompt,
                         "prompt_source": source,
                         "prompt_source_detail": source_detail,
+                        "system_prompt": system_prompt,
+                        "system_source": system_source,
+                        "tools": tools,
+                        "tools_source": tools_source,
                     }
+                    record.update(extract_dataset_metadata(row, dataset_id))
                     if error is not None:
                         record["extraction_error"] = error
 
