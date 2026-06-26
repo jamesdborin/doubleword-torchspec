@@ -17,7 +17,16 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_OUTPUT_ROOT = Path("/tmp/nemotron_prompt_only_exports")
+DEFAULT_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "NEMOTRON_PROMPT_OUTPUT_ROOT",
+        (
+            "/workspace/nemotron_prompt_only_exports"
+            if Path("/workspace").is_dir()
+            else "/tmp/nemotron_prompt_only_exports"
+        ),
+    )
+)
 DEFAULT_SURVEY = Path(__file__).resolve().parent.parent / "nemotron_post_training_v3_dataset_survey.md"
 SUMMARY_JSON_MARKER = "```json\n"
 

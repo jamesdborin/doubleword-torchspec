@@ -32,12 +32,22 @@ from nemotron_prompt_extraction import (
     load_stream,
     PROMPT_COLUMNS,
     prompt_record_to_csv_row,
+    should_write_prompt_record,
 )
 
 
 DEFAULT_OWNER = "jamesdborin"
 DEFAULT_COLLECTION_TITLE = "Nemotron-Post-Training-v3 Prompt-Only"
-DEFAULT_OUTPUT_ROOT = Path("/tmp/nemotron_prompt_only_exports")
+DEFAULT_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "NEMOTRON_PROMPT_OUTPUT_ROOT",
+        (
+            "/workspace/nemotron_prompt_only_exports"
+            if Path("/workspace").is_dir()
+            else "/tmp/nemotron_prompt_only_exports"
+        ),
+    )
+)
 
 SUMMARY_COLUMNS = [
     "dataset_id",
@@ -529,6 +539,7 @@ def extract_dataset(
             started_at = utc_now()
             observed_rows = 0
             extracted_rows = 0
+            skipped_rows = 0
             null_rows = 0
             empty_rows = 0
             extraction_errors = 0
@@ -578,7 +589,6 @@ def extract_dataset(
                     record.update(extract_dataset_metadata(row, dataset_id))
                     if extraction_error is not None:
                         record["extraction_error"] = extraction_error
-                    output_writer.writerow(prompt_record_to_csv_row(record))
 
                     reason = None
                     if prompt is None:
@@ -590,6 +600,7 @@ def extract_dataset(
                     if extraction_error is not None:
                         reason = "extraction_error"
                     if reason is not None:
+                        skipped_rows += 1
                         write_markdown_table_row(
                             bad_handle,
                             BAD_ROW_COLUMNS,
@@ -604,13 +615,18 @@ def extract_dataset(
                                 "extraction_error": extraction_error or "",
                             },
                         )
+                    elif should_write_prompt_record(record):
+                        output_writer.writerow(prompt_record_to_csv_row(record))
+                        extracted_rows += 1
+                        total_written += 1
+                    else:
+                        skipped_rows += 1
 
-                    extracted_rows += 1
-                    total_written += 1
-                    if extracted_rows == 1 or extracted_rows % 10000 == 0:
+                    if observed_rows == 1 or observed_rows % 10000 == 0:
                         log(
                             f"{dataset_id} {source.config}/{source.split}: "
-                            f"{extracted_rows} rows, null={null_rows}, "
+                            f"observed={observed_rows}, written={extracted_rows}, "
+                            f"skipped={skipped_rows}, null={null_rows}, "
                             f"empty={empty_rows}, errors={extraction_errors}"
                         )
             except Exception as exc:
@@ -665,6 +681,28 @@ def cleanup_cache(cache_root: Path) -> None:
     if cache_root.exists():
         shutil.rmtree(cache_root, ignore_errors=True)
         log(f"deleted isolated Hugging Face cache {cache_root}")
+
+
+def cleanup_transient_artifacts(dataset_dir: Path) -> None:
+    patterns = [
+        "prompts.csv.tmp",
+        "prompts.csv.partial",
+        "prompts.jsonl.tmp",
+        "prompts.jsonl.partial",
+        "summary.md.tmp",
+        "summary.csv.tmp",
+        "status.json.tmp",
+    ]
+    for name in patterns:
+        path = dataset_dir / name
+        if path.exists():
+            path.unlink(missing_ok=True)
+
+
+def cleanup_local_artifacts(dataset_dir: Path) -> None:
+    if dataset_dir.exists():
+        shutil.rmtree(dataset_dir, ignore_errors=True)
+        log(f"deleted local dataset artifacts {dataset_dir}")
 
 
 def total_row_from_summary(summary_path: Path) -> dict[str, str]:
@@ -802,6 +840,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-for-auth", action="store_true")
     parser.add_argument("--cleanup-cache", action="store_true", default=True)
     parser.add_argument("--no-cleanup-cache", dest="cleanup_cache", action="store_false")
+    parser.add_argument(
+        "--cleanup-local-artifacts",
+        action="store_true",
+        help="Delete the local dataset artifact directory after successful upload.",
+    )
+    parser.add_argument(
+        "--keep-local-artifacts",
+        dest="cleanup_local_artifacts",
+        action="store_false",
+    )
+    parser.set_defaults(cleanup_local_artifacts=False)
     parser.add_argument("--semaphore-dir", type=Path)
     parser.add_argument("--max-concurrent", type=int, default=1)
     parser.add_argument("--upload-semaphore-dir", type=Path)
@@ -877,6 +926,9 @@ def main() -> int:
         if args.cleanup_cache:
             cleanup_cache(cache_root)
         write_status(dataset_dir, dataset=args.dataset, phase="complete")
+        cleanup_transient_artifacts(dataset_dir)
+        if args.cleanup_local_artifacts:
+            cleanup_local_artifacts(dataset_dir)
         return 0
     except Exception as exc:
         if summary_path.exists():
@@ -890,6 +942,10 @@ def main() -> int:
         )
         log(f"ERROR: {type(exc).__name__}: {exc}")
         return 1
+    finally:
+        if args.cleanup_cache:
+            cleanup_cache(cache_root)
+        cleanup_transient_artifacts(dataset_dir)
 
 
 if __name__ == "__main__":

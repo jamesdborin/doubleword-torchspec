@@ -37,10 +37,11 @@ Output rows include:
 - `tools`
 - `tools_source`
 
-The extractor always writes one output record for each input sample it iterates. If a row
-cannot be normalized into a prompt, the output record is still written with `prompt: null`
-and extraction metadata so CSV row count remains aligned with dataset sample count.
-Nested values such as `tools` are JSON-encoded inside CSV cells.
+The extractor writes one output record for each input sample that can be normalized
+into a non-empty prompt. Rows that cannot produce a prompt are omitted from
+`prompts.csv` and recorded in `null_or_empty_rows.md`, so the Hugging Face dataset
+viewer does not show null prompt rows. Nested values such as `tools` are
+JSON-encoded inside CSV cells.
 
 For multi-turn chat/tool trajectories, the extractor preserves the first non-empty
 user message in `prompt`. Non-empty leading system/developer context is preserved
@@ -51,29 +52,50 @@ treated as completion/trajectory data and are not included in the prompt-only ou
 
 ## Full prompt-only export and upload
 
-To launch one tmux pane per dataset in the Nemotron Post-Training v3 collection:
+To launch a single sequential tmux worker for every dataset in the Nemotron
+Post-Training v3 collection:
 
 ```bash
 python3 examples/doubleword/data/nemotron_prompt_extractors/launch_prompt_only_tmux.py
 ```
 
-This creates the `nemotron-prompts` tmux session with one worker pane per dataset.
-By default, workers run through `uv` with `datasets==5.0.0` so repos with HF
-`Json` feature metadata load correctly. Three workers may extract at once and
-two workers may upload at once.
-Outputs are written under `/tmp/nemotron_prompt_only_exports`:
+This creates the `nemotron-prompts` tmux session with one worker pane. The worker
+runs each dataset end-to-end before starting the next one: download, extract,
+upload, clear isolated Hugging Face cache, and delete the local per-dataset
+artifact directory after a successful upload. This avoids multiple datasets
+filling the cache at once.
+
+By default, scripts write under `/workspace/nemotron_prompt_only_exports` when
+`/workspace` exists, otherwise `/tmp/nemotron_prompt_only_exports`. Override this
+on any machine with either:
+
+```bash
+NEMOTRON_PROMPT_OUTPUT_ROOT=/mnt/big-disk/nemotron_prompt_only_exports \
+  python3 examples/doubleword/data/nemotron_prompt_extractors/launch_prompt_only_tmux.py
+```
+
+or:
+
+```bash
+python3 examples/doubleword/data/nemotron_prompt_extractors/launch_prompt_only_tmux.py \
+  --output-root /mnt/big-disk/nemotron_prompt_only_exports
+```
+
+During the run, outputs are written under the output root:
 
 - `<dataset>/prompts.csv`
 - `<dataset>/summary.md`
 - `<dataset>/null_or_empty_rows.md`
 - `summary.md` with one aggregate row per dataset
-- `dataset_manifest.csv` with tmux pane and target repo mapping
+- `dataset_manifest.csv` with target repo mapping
+- `logs/` with one log per dataset and the single-worker log
 
-Each worker isolates Hugging Face cache under the output root and deletes that cache
-after extraction. Uploads wait until Hugging Face is authenticated as `jamesdborin`,
-then create or update `jamesdborin/<original-dataset-title>-prompt-only`, upload
-`prompts.csv` plus Markdown diagnostics, and add dataset-card metadata that points
-the Hugging Face dataset viewer at that CSV as the `train` split. The repo is then added to the
+Each dataset isolates Hugging Face cache under the output root and deletes that
+cache after extraction/upload, including on failure. Uploads wait until Hugging
+Face is authenticated as `jamesdborin`, then create or update
+`jamesdborin/<original-dataset-title>-prompt-only`, upload `prompts.csv` plus
+Markdown diagnostics, and add dataset-card metadata that points the Hugging Face
+dataset viewer at that CSV as the `train` split. The repo is then added to the
 `Nemotron-Post-Training-v3 Prompt-Only` collection.
 
 ## Legacy local JSONL viewer
@@ -82,7 +104,7 @@ The local viewer is still available for older JSONL exports:
 
 ```bash
 python3 examples/doubleword/data/nemotron_prompt_extractors/jsonl_viewer.py \
-  --output-root /tmp/nemotron_prompt_only_exports
+  --output-root /workspace/nemotron_prompt_only_exports
 ```
 
 Open `http://127.0.0.1:8766`. The viewer scans for old `prompts.jsonl` and

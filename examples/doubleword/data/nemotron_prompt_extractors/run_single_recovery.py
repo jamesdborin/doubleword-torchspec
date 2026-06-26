@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shlex
@@ -15,7 +16,17 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 WORKER = Path(__file__).with_name("export_prompt_only_dataset.py")
-OUTPUT_ROOT = Path("/tmp/nemotron_prompt_only_exports")
+DEFAULT_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "NEMOTRON_PROMPT_OUTPUT_ROOT",
+        (
+            "/workspace/nemotron_prompt_only_exports"
+            if Path("/workspace").is_dir()
+            else "/tmp/nemotron_prompt_only_exports"
+        ),
+    )
+)
+OUTPUT_ROOT = DEFAULT_OUTPUT_ROOT
 OWNER = "jamesdborin"
 COLLECTION_TITLE = "Nemotron-Post-Training-v3 Prompt-Only"
 SUMMARY_JSON_MARKER = "```json\n"
@@ -168,6 +179,7 @@ def run_worker(dataset_id: str, force: bool) -> int:
         "--max-upload-concurrent",
         "1",
         "--wait-for-auth",
+        "--cleanup-local-artifacts",
     ]
     if force:
         command.append("--force")
@@ -187,7 +199,22 @@ def run_worker(dataset_id: str, force: bool) -> int:
         ).returncode
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run Nemotron prompt exports one at a time with cache cleanup."
+    )
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--owner", default=OWNER)
+    parser.add_argument("--collection-title", default=COLLECTION_TITLE)
+    return parser.parse_args()
+
+
 def main() -> int:
+    global OUTPUT_ROOT, OWNER, COLLECTION_TITLE
+    args = parse_args()
+    OUTPUT_ROOT = args.output_root.expanduser().resolve()
+    OWNER = args.owner
+    COLLECTION_TITLE = args.collection_title
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     (OUTPUT_ROOT / ".hf_cache").mkdir(parents=True, exist_ok=True)
     log(f"single recovery worker starting with {len(DATASETS)} dataset(s)")

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Launch one tmux pane per Nemotron prompt-only export worker."""
+"""Launch one tmux worker for sequential Nemotron prompt-only exports."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import shlex
 import subprocess
 import sys
@@ -15,7 +16,16 @@ from nemotron_prompt_extraction import DATASET_SPECS
 
 DEFAULT_ORIGINAL_COLLECTION = "nvidia/nemotron-post-training-v3"
 DEFAULT_COLLECTION_TITLE = "Nemotron-Post-Training-v3 Prompt-Only"
-DEFAULT_OUTPUT_ROOT = Path("/tmp/nemotron_prompt_only_exports")
+DEFAULT_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "NEMOTRON_PROMPT_OUTPUT_ROOT",
+        (
+            "/workspace/nemotron_prompt_only_exports"
+            if Path("/workspace").is_dir()
+            else "/tmp/nemotron_prompt_only_exports"
+        ),
+    )
+)
 DEFAULT_OWNER = "jamesdborin"
 DEFAULT_SESSION = "nemotron-prompts"
 
@@ -74,7 +84,6 @@ def write_manifest(
     output_root: Path,
     datasets: list[str],
     owner: str,
-    panes_per_window: int,
 ) -> Path:
     manifest_path = output_root / "dataset_manifest.csv"
     with manifest_path.open("w", encoding="utf-8", newline="") as handle:
@@ -96,7 +105,7 @@ def write_manifest(
                     "dataset_id": dataset_id,
                     "prompt_only_repo_id": prompt_only_repo_id(dataset_id, owner),
                     "local_output_dir": str(output_root / local_dataset_name(dataset_id)),
-                    "tmux_window": f"batch-{index // panes_per_window:02d}",
+                    "tmux_window": "single-worker",
                 }
             )
     return manifest_path
@@ -117,6 +126,8 @@ def build_worker_command(
     force: bool,
     limit: int | None,
     use_uv: bool,
+    cleanup_local_artifacts: bool,
+    hold_open: bool = True,
 ) -> str:
     log_dir = output_root / "logs"
     log_path = log_dir / f"{local_dataset_name(dataset_id)}.log"
@@ -165,17 +176,23 @@ def build_worker_command(
         command.append("--force")
     if limit is not None:
         command.extend(["--limit", str(limit)])
+    if cleanup_local_artifacts and not skip_upload:
+        command.append("--cleanup-local-artifacts")
 
     command_text = shlex.join(command)
-    return (
+    shell_command = (
         f"cd {shlex.quote(str(repo_root))} && "
         f"mkdir -p {shlex.quote(str(log_dir))} && "
         "set -o pipefail && "
         f"{command_text} 2>&1 | tee -a {shlex.quote(str(log_path))}; "
         "rc=${PIPESTATUS[0]}; "
         f"echo; echo '[exit '$rc'] {shlex.quote(dataset_id)}'; "
-        "exec bash"
     )
+    if hold_open:
+        shell_command += "exec bash"
+    else:
+        shell_command += "exit $rc"
+    return shell_command
 
 
 def start_command(target: str, shell_command: str) -> None:
@@ -194,11 +211,9 @@ def first_pane_id(window_target: str) -> str:
     return output.splitlines()[0]
 
 
-def launch_tmux(
+def write_single_worker_script(
     *,
-    session_name: str,
     datasets: list[str],
-    panes_per_window: int,
     repo_root: Path,
     worker_script: Path,
     output_root: Path,
@@ -211,48 +226,19 @@ def launch_tmux(
     force: bool,
     limit: int | None,
     use_uv: bool,
-) -> None:
-    run(["tmux", "new-session", "-d", "-s", session_name, "-n", "batch-00"])
-    run(["tmux", "set-option", "-t", session_name, "pane-border-status", "top"])
-    run(
-        [
-            "tmux",
-            "set-option",
-            "-t",
-            session_name,
-            "pane-border-format",
-            "#{pane_index}: #{pane_title}",
-        ]
-    )
+    cleanup_local_artifacts: bool,
+) -> Path:
+    script_path = output_root / "run_single_worker.sh"
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -u",
+        f"cd {shlex.quote(str(repo_root))}",
+        f"mkdir -p {shlex.quote(str(output_root / 'logs'))}",
+        f"echo '[single-worker start]' $(date -Iseconds) | tee -a {shlex.quote(str(output_root / 'logs' / 'single-worker.log'))}",
+    ]
 
     for index, dataset_id in enumerate(datasets):
-        window_index = index // panes_per_window
-        pane_index = index % panes_per_window
-        window_name = f"batch-{window_index:02d}"
-        window_target = f"{session_name}:{window_name}"
-
-        if pane_index == 0 and window_index > 0:
-            run(["tmux", "new-window", "-t", session_name, "-n", window_name])
-            pane_target = first_pane_id(window_target)
-        elif pane_index == 0:
-            pane_target = first_pane_id(window_target)
-        else:
-            pane_target = run(
-                [
-                    "tmux",
-                    "split-window",
-                    "-t",
-                    window_target,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ],
-                capture=True,
-            )
-
-        title = f"agent-{index:02d} {dataset_title(dataset_id)}"
-        set_pane_title(pane_target, title)
-        shell_command = build_worker_command(
+        command = build_worker_command(
             repo_root=repo_root,
             worker_script=worker_script,
             output_root=output_root,
@@ -266,24 +252,74 @@ def launch_tmux(
             force=force,
             limit=limit,
             use_uv=use_uv,
+            cleanup_local_artifacts=cleanup_local_artifacts,
+            hold_open=False,
         )
-        start_command(pane_target, shell_command)
-        set_pane_title(pane_target, title)
-        run(["tmux", "select-layout", "-t", window_target, "tiled"])
+        lines.extend(
+            [
+                "",
+                f"echo '[dataset {index + 1}/{len(datasets)}] {dataset_id}' | tee -a {shlex.quote(str(output_root / 'logs' / 'single-worker.log'))}",
+                f"bash -lc {shlex.quote(command)}",
+                "rc=$?",
+                "if [ \"$rc\" -ne 0 ]; then",
+                f"  echo '[single-worker failed rc='$rc'] {dataset_id}' | tee -a {shlex.quote(str(output_root / 'logs' / 'single-worker.log'))}",
+                "  exit \"$rc\"",
+                "fi",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            f"rm -rf {shlex.quote(str(output_root / '.hf_cache'))}",
+            f"find {shlex.quote(str(output_root))} -name '*.tmp' -o -name '*.partial' | xargs -r rm -f",
+            f"echo '[single-worker complete]' $(date -Iseconds) | tee -a {shlex.quote(str(output_root / 'logs' / 'single-worker.log'))}",
+            "exec bash",
+        ]
+    )
+    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+    return script_path
+
+
+def launch_tmux(
+    *,
+    session_name: str,
+    script_path: Path,
+) -> None:
+    run(["tmux", "new-session", "-d", "-s", session_name, "-n", "single-worker"])
+    run(["tmux", "set-option", "-t", session_name, "pane-border-status", "top"])
+    run(
+        [
+            "tmux",
+            "set-option",
+            "-t",
+            session_name,
+            "pane-border-format",
+            "#{pane_index}: #{pane_title}",
+        ]
+    )
+    pane_target = first_pane_id(f"{session_name}:single-worker")
+    set_pane_title(pane_target, "single sequential worker")
+    start_command(pane_target, str(script_path))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch tmux workers for all Nemotron prompt-only exports."
+        description="Launch one tmux worker for all Nemotron prompt-only exports."
     )
     parser.add_argument("--session-name", default=DEFAULT_SESSION)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--owner", default=DEFAULT_OWNER)
     parser.add_argument("--collection-title", default=DEFAULT_COLLECTION_TITLE)
     parser.add_argument("--original-collection", default=DEFAULT_ORIGINAL_COLLECTION)
-    parser.add_argument("--max-concurrent", type=int, default=3)
-    parser.add_argument("--max-upload-concurrent", type=int, default=2)
-    parser.add_argument("--panes-per-window", type=int, default=7)
+    parser.add_argument("--max-concurrent", type=int, default=1)
+    parser.add_argument("--max-upload-concurrent", type=int, default=1)
+    parser.add_argument(
+        "--panes-per-window",
+        type=int,
+        default=1,
+        help="Deprecated; kept for CLI compatibility. The launcher uses one pane.",
+    )
     parser.add_argument("--no-wait-for-auth", dest="wait_for_auth", action="store_false")
     parser.set_defaults(wait_for_auth=True)
     parser.add_argument("--skip-upload", action="store_true")
@@ -292,6 +328,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--kill-existing", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--cleanup-local-artifacts",
+        action="store_true",
+        help="Delete each dataset's local artifact directory after successful upload.",
+    )
+    parser.add_argument(
+        "--keep-local-artifacts",
+        dest="cleanup_local_artifacts",
+        action="store_false",
+    )
+    parser.set_defaults(cleanup_local_artifacts=True)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -313,12 +360,28 @@ def main() -> int:
         output_root=output_root,
         datasets=datasets,
         owner=args.owner,
-        panes_per_window=args.panes_per_window,
+    )
+    script_path = write_single_worker_script(
+        datasets=datasets,
+        repo_root=repo_root,
+        worker_script=worker_script,
+        output_root=output_root,
+        owner=args.owner,
+        collection_title=args.collection_title,
+        max_concurrent=args.max_concurrent,
+        max_upload_concurrent=args.max_upload_concurrent,
+        wait_for_auth=args.wait_for_auth,
+        skip_upload=args.skip_upload,
+        force=args.force,
+        limit=args.limit,
+        use_uv=args.use_uv,
+        cleanup_local_artifacts=args.cleanup_local_artifacts,
     )
 
     if args.dry_run:
-        print(f"Would launch {len(datasets)} panes in session {args.session_name}")
+        print(f"Would launch one sequential worker for {len(datasets)} datasets in session {args.session_name}")
         print(f"Manifest: {manifest_path}")
+        print(f"Worker script: {script_path}")
         return 0
 
     if session_exists(args.session_name):
@@ -334,26 +397,14 @@ def main() -> int:
 
     launch_tmux(
         session_name=args.session_name,
-        datasets=datasets,
-        panes_per_window=args.panes_per_window,
-        repo_root=repo_root,
-        worker_script=worker_script,
-        output_root=output_root,
-        owner=args.owner,
-        collection_title=args.collection_title,
-        max_concurrent=args.max_concurrent,
-        max_upload_concurrent=args.max_upload_concurrent,
-        wait_for_auth=args.wait_for_auth,
-        skip_upload=args.skip_upload,
-        force=args.force,
-        limit=args.limit,
-        use_uv=args.use_uv,
+        script_path=script_path,
     )
 
-    print(f"Launched {len(datasets)} panes in tmux session {args.session_name}")
+    print(f"Launched one sequential worker for {len(datasets)} datasets in tmux session {args.session_name}")
     print(f"Attach: tmux attach -t {args.session_name}")
     print(f"Output root: {output_root}")
     print(f"Manifest: {manifest_path}")
+    print(f"Worker script: {script_path}")
     return 0
 
 

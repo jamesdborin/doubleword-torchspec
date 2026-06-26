@@ -85,7 +85,14 @@ DATASET_SPECS: dict[str, dict[str, Any]] = {
         "priority": ["responses_input"],
     },
     "nvidia/Nemotron-RL-Super-Training-Blends": {
-        "priority": ["responses_input", "prompt", "messages", "question", "problem"],
+        "priority": [
+            "responses_input",
+            "responses_metadata_problem_statement",
+            "prompt",
+            "messages",
+            "question",
+            "problem",
+        ],
         "data_files": [
             {"config": DEFAULT_CONFIG, "split": "rlvr1", "path": "rlvr1.jsonl"},
             {"config": DEFAULT_CONFIG, "split": "rlvr2", "path": "rlvr2.jsonl"},
@@ -405,6 +412,16 @@ def responses_tools(row: dict[str, Any]) -> Any:
     return params.get("tools")
 
 
+def responses_metadata_value(row: dict[str, Any], key: str) -> Any:
+    params = parse_jsonish(row.get("responses_create_params"))
+    if not isinstance(params, dict):
+        return None
+    metadata = parse_jsonish(params.get("metadata"))
+    if not isinstance(metadata, dict):
+        return None
+    return metadata.get(key)
+
+
 def extract_tools_for_source(row: dict[str, Any], source: str | None) -> tuple[Any, str | None]:
     if source == "responses_input":
         tools = normalize_tools(responses_tools(row))
@@ -449,6 +466,9 @@ def extract_prompt(
     for source in spec["priority"]:
         if source == "responses_input":
             prompt, detail = first_message_prompt(responses_input(row))
+        elif source == "responses_metadata_problem_statement":
+            prompt = content_to_text(responses_metadata_value(row, "problem_statement"))
+            detail = "responses_create_params.metadata.problem_statement"
         elif source == "ifbench_prompt":
             prompt = content_to_text(row.get("prompt")) if is_ifbench_row(row, config) else None
             detail = "prompt" if prompt else "not_ifbench"
@@ -482,6 +502,11 @@ def csv_cell(value: Any) -> Any:
 
 def prompt_record_to_csv_row(record: dict[str, Any]) -> dict[str, Any]:
     return {column: csv_cell(record.get(column)) for column in PROMPT_COLUMNS}
+
+
+def should_write_prompt_record(record: dict[str, Any]) -> bool:
+    prompt = record.get("prompt")
+    return isinstance(prompt, str) and bool(prompt.strip())
 
 
 def dataset_configs(dataset_id: str, requested_config: str | None) -> list[str | None]:
@@ -770,8 +795,9 @@ def write_prompts(
                 if error is not None:
                     record["extraction_error"] = error
 
-                writer.writerow(prompt_record_to_csv_row(record))
-                total += 1
+                if should_write_prompt_record(record):
+                    writer.writerow(prompt_record_to_csv_row(record))
+                    total += 1
                 if limit is not None and total >= limit:
                     return total
     return total

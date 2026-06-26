@@ -214,6 +214,56 @@ def test_structured_outputs_writer_includes_schema_str() -> None:
     assert record["schema_str"] == rows[0]["schema_str"]
 
 
+def test_super_training_blends_uses_responses_metadata_problem_statement() -> None:
+    row = {
+        "responses_create_params": {
+            "input": [],
+            "metadata": {
+                "problem_statement": "[ISSUE]\nFix the masked array comparison."
+            },
+        }
+    }
+
+    prompt, source, detail = extract_prompt(
+        row, "nvidia/Nemotron-RL-Super-Training-Blends"
+    )
+
+    assert prompt == "[ISSUE]\nFix the masked array comparison."
+    assert source == "responses_metadata_problem_statement"
+    assert detail == "responses_create_params.metadata.problem_statement"
+
+
+def test_writer_skips_rows_without_prompt() -> None:
+    import nemotron_prompt_extraction
+
+    rows = [
+        {"_hf_placeholder": True, "dataset": "tau2", "agent_ref": "x"},
+        {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "Keep this prompt."}]
+            }
+        },
+    ]
+    original_load_jsonl_file = nemotron_prompt_extraction.load_jsonl_file
+    nemotron_prompt_extraction.load_jsonl_file = lambda _dataset_id, _path: iter(rows)
+    try:
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "prompts.csv"
+            count = write_prompts(
+                "nvidia/Nemotron-RL-Super-Training-Blends",
+                output_path,
+                requested_split="rlvr1",
+            )
+            with output_path.open(encoding="utf-8", newline="") as handle:
+                records = list(csv.DictReader(handle))
+    finally:
+        nemotron_prompt_extraction.load_jsonl_file = original_load_jsonl_file
+
+    assert count == 1
+    assert len(records) == 1
+    assert records[0]["prompt"] == "Keep this prompt."
+
+
 if __name__ == "__main__":
     test_responses_input_first_user()
     test_messages_first_user()
@@ -225,3 +275,5 @@ if __name__ == "__main__":
     test_messages_include_top_level_tools()
     test_responses_input_include_response_tools()
     test_structured_outputs_writer_includes_schema_str()
+    test_super_training_blends_uses_responses_metadata_problem_statement()
+    test_writer_skips_rows_without_prompt()
