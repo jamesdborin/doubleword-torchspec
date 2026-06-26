@@ -19,6 +19,7 @@ from typing import Any
 
 DEFAULT_OUTPUT_ROOT = Path("/tmp/nemotron_prompt_only_exports")
 DEFAULT_SURVEY = Path(__file__).resolve().parent.parent / "nemotron_post_training_v3_dataset_survey.md"
+SUMMARY_JSON_MARKER = "```json\n"
 
 LOG_ROWS_RE = re.compile(r":\s+([0-9]+)\s+rows,\s+null=([0-9]+),\s+empty=([0-9]+),\s+errors=([0-9]+)")
 LOG_EXTRACT_RE = re.compile(r"extracting\s+(\S+)\s+config=(\S+)\s+split=(\S+)\s+path=(.*)$")
@@ -43,6 +44,24 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text())
     except Exception:
         return {}
+
+
+def read_summary_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    start = text.find(SUMMARY_JSON_MARKER)
+    if start < 0:
+        return []
+    start += len(SUMMARY_JSON_MARKER)
+    end = text.find("\n```", start)
+    if end < 0:
+        return []
+    try:
+        rows = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return []
+    return rows if isinstance(rows, list) else []
 
 
 def parse_int(value: Any) -> int | None:
@@ -101,7 +120,10 @@ def line_count(path: Path) -> int | None:
         return None
     try:
         output = subprocess.check_output(["wc", "-l", str(path)], text=True, timeout=5)
-        return int(output.strip().split()[0])
+        lines = int(output.strip().split()[0])
+        if path.suffix == ".csv":
+            return max(0, lines - 1)
+        return lines
     except Exception:
         return None
 
@@ -179,7 +201,7 @@ def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
     manifest_rows = read_csv(output_root / "dataset_manifest.csv")
     summary_rows = {
         row["dataset_id"]: row
-        for row in read_csv(output_root / "summary.csv")
+        for row in read_summary_rows(output_root / "summary.md")
         if row.get("config") == "__total__"
     }
     survey_counts = parse_survey_counts(survey_path)
@@ -192,9 +214,9 @@ def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
         summary = summary_rows.get(dataset_id, {})
         status = read_json(local_dir / "status.json")
         log_state = read_log_state(output_root, dataset_id)
-        prompt_path = local_dir / "prompts.jsonl"
-        tmp_prompt_path = local_dir / "prompts.jsonl.tmp"
-        bad_rows_path = local_dir / "null_or_empty_rows.csv"
+        prompt_path = local_dir / "prompts.csv"
+        tmp_prompt_path = local_dir / "prompts.csv.tmp"
+        bad_rows_path = local_dir / "null_or_empty_rows.md"
 
         expected = parse_int(summary.get("original_rows_for_delta")) or survey_counts.get(dataset_id)
         extracted = parse_int(summary.get("extracted_rows"))

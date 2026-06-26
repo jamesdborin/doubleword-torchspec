@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dependency-light smoke tests for prompt normalization."""
 
-import json
+import csv
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -198,13 +198,14 @@ def test_structured_outputs_writer_includes_schema_str() -> None:
     nemotron_prompt_extraction.load_parquet_file = lambda _dataset_id, _path: iter(rows)
     try:
         with TemporaryDirectory() as temp_dir:
-            output_path = Path(temp_dir) / "prompts.jsonl"
+            output_path = Path(temp_dir) / "prompts.csv"
             count = write_prompts(
                 "nvidia/Nemotron-RL-Instruction-Following-Structured-Outputs-v2",
                 output_path,
                 requested_split="direct_generation",
             )
-            record = json.loads(output_path.read_text(encoding="utf-8"))
+            with output_path.open(encoding="utf-8", newline="") as handle:
+                record = next(csv.DictReader(handle))
     finally:
         nemotron_prompt_extraction.load_parquet_file = original_load_parquet_file
 

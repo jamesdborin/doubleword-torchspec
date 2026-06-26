@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export one Nemotron dataset as prompt-only JSONL and upload it to HF."""
+"""Export one Nemotron dataset as prompt-only CSV and upload it to HF."""
 
 from __future__ import annotations
 
@@ -23,12 +23,15 @@ from nemotron_prompt_extraction import (
     dataset_configs,
     dataset_data_files,
     dataset_splits,
+    extract_dataset_metadata,
     extract_prompt,
     extract_system_for_source,
     extract_tools_for_source,
     load_jsonl_file,
     load_parquet_file,
     load_stream,
+    PROMPT_COLUMNS,
+    prompt_record_to_csv_row,
 )
 
 
@@ -59,9 +62,10 @@ SUMMARY_COLUMNS = [
     "started_at",
     "finished_at",
     "duration_seconds",
-    "output_jsonl",
+    "output_csv",
     "error",
 ]
+SUMMARY_JSON_MARKER = "```json\n"
 
 BAD_ROW_COLUMNS = [
     "dataset_id",
@@ -101,7 +105,7 @@ class SourceStats:
     started_at: str
     finished_at: str
     duration_seconds: float
-    output_jsonl: str
+    output_csv: str
     error: str = ""
 
     def to_row(self, upload_status: str) -> dict[str, Any]:
@@ -136,7 +140,7 @@ class SourceStats:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_seconds": f"{self.duration_seconds:.3f}",
-            "output_jsonl": self.output_jsonl,
+            "output_csv": self.output_csv,
             "error": self.error,
         }
 
@@ -305,6 +309,40 @@ def empty_to_csv(value: Any) -> Any:
     return "" if value is None else value
 
 
+def markdown_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+def write_markdown_table_header(handle: Any, columns: list[str]) -> None:
+    handle.write("| " + " | ".join(columns) + " |\n")
+    handle.write("| " + " | ".join("---" for _ in columns) + " |\n")
+
+
+def write_markdown_table_row(
+    handle: Any, columns: list[str], row: dict[str, Any]
+) -> None:
+    handle.write("| " + " | ".join(markdown_cell(row.get(column)) for column in columns) + " |\n")
+
+
+def read_summary_rows(summary_path: Path) -> list[dict[str, Any]]:
+    if not summary_path.exists():
+        return []
+    text = summary_path.read_text(encoding="utf-8")
+    start = text.find(SUMMARY_JSON_MARKER)
+    if start < 0:
+        return []
+    start += len(SUMMARY_JSON_MARKER)
+    end = text.find("\n```", start)
+    if end < 0:
+        return []
+    try:
+        rows = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
 def total_summary_row(rows: list[SourceStats], upload_status: str) -> dict[str, Any]:
     expected_values = [row.expected_original_rows for row in rows]
     expected_total = (
@@ -352,7 +390,7 @@ def total_summary_row(rows: list[SourceStats], upload_status: str) -> dict[str, 
         "started_at": started,
         "finished_at": finished,
         "duration_seconds": f"{duration:.3f}",
-        "output_jsonl": first.output_jsonl,
+        "output_csv": first.output_csv,
         "error": "; ".join(row.error for row in rows if row.error),
     }
 
@@ -362,31 +400,61 @@ def write_summary(
     rows: list[SourceStats],
     upload_status: str,
 ) -> None:
-    csv_rows = [row.to_row(upload_status) for row in rows]
+    summary_rows = [row.to_row(upload_status) for row in rows]
     if rows:
-        csv_rows.append(total_summary_row(rows, upload_status))
-    tmp_path = summary_path.with_suffix(".csv.tmp")
-    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
-        writer.writeheader()
-        for row in csv_rows:
-            writer.writerow({key: empty_to_csv(row.get(key)) for key in SUMMARY_COLUMNS})
+        summary_rows.append(total_summary_row(rows, upload_status))
+    normalized_rows = [
+        {key: empty_to_csv(row.get(key)) for key in SUMMARY_COLUMNS}
+        for row in summary_rows
+    ]
+    total = next(
+        (row for row in normalized_rows if row.get("config") == "__total__"),
+        {},
+    )
+    tmp_path = summary_path.with_suffix(".md.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write("# Extraction Summary\n\n")
+        if total:
+            handle.write("## Totals\n\n")
+            write_markdown_table_header(handle, SUMMARY_COLUMNS)
+            write_markdown_table_row(handle, SUMMARY_COLUMNS, total)
+            handle.write("\n")
+        handle.write("## Sources\n\n")
+        write_markdown_table_header(handle, SUMMARY_COLUMNS)
+        for row in normalized_rows:
+            if row.get("config") != "__total__":
+                write_markdown_table_row(handle, SUMMARY_COLUMNS, row)
+        handle.write("\n## Machine-readable rows\n\n")
+        handle.write(SUMMARY_JSON_MARKER)
+        handle.write(json.dumps(normalized_rows, ensure_ascii=False, indent=2))
+        handle.write("\n```\n")
     tmp_path.replace(summary_path)
 
 
 def set_summary_upload_status(summary_path: Path, upload_status: str) -> None:
-    if not summary_path.exists():
+    rows = read_summary_rows(summary_path)
+    if not rows:
         return
-    with summary_path.open(encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
     for row in rows:
         row["upload_status"] = upload_status
-    tmp_path = summary_path.with_suffix(".csv.tmp")
-    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in SUMMARY_COLUMNS})
+    source_rows = [row for row in rows if row.get("config") != "__total__"]
+    tmp_path = summary_path.with_suffix(".md.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write("# Extraction Summary\n\n")
+        total = next((row for row in rows if row.get("config") == "__total__"), {})
+        if total:
+            handle.write("## Totals\n\n")
+            write_markdown_table_header(handle, SUMMARY_COLUMNS)
+            write_markdown_table_row(handle, SUMMARY_COLUMNS, total)
+            handle.write("\n")
+        handle.write("## Sources\n\n")
+        write_markdown_table_header(handle, SUMMARY_COLUMNS)
+        for row in source_rows:
+            write_markdown_table_row(handle, SUMMARY_COLUMNS, row)
+        handle.write("\n## Machine-readable rows\n\n")
+        handle.write(SUMMARY_JSON_MARKER)
+        handle.write(json.dumps(rows, ensure_ascii=False, indent=2))
+        handle.write("\n```\n")
     tmp_path.replace(summary_path)
 
 
@@ -398,18 +466,21 @@ def refresh_aggregate_summary(output_root: Path) -> None:
     with lock_path.open("w") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
         rows: list[dict[str, str]] = []
-        for summary_path in sorted(output_root.glob("*/summary.csv")):
-            with summary_path.open(encoding="utf-8", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    if row.get("config") == "__total__":
-                        rows.append(row)
-        tmp_path = output_root / "summary.csv.tmp"
-        with tmp_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
-            writer.writeheader()
+        for summary_path in sorted(output_root.glob("*/summary.md")):
+            for row in read_summary_rows(summary_path):
+                if row.get("config") == "__total__":
+                    rows.append(row)
+        tmp_path = output_root / "summary.md.tmp"
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write("# Aggregate Extraction Summary\n\n")
+            write_markdown_table_header(handle, SUMMARY_COLUMNS)
             for row in rows:
-                writer.writerow({key: row.get(key, "") for key in SUMMARY_COLUMNS})
-        tmp_path.replace(output_root / "summary.csv")
+                write_markdown_table_row(handle, SUMMARY_COLUMNS, row)
+            handle.write("\n## Machine-readable rows\n\n")
+            handle.write(SUMMARY_JSON_MARKER)
+            handle.write(json.dumps(rows, ensure_ascii=False, indent=2))
+            handle.write("\n```\n")
+        tmp_path.replace(output_root / "summary.md")
 
 
 def extract_dataset(
@@ -425,9 +496,9 @@ def extract_dataset(
     repo_id = prompt_only_repo_id(dataset_id, owner)
     dataset_dir = output_root / local_dataset_name(dataset_id)
     dataset_dir.mkdir(parents=True, exist_ok=True)
-    output_path = dataset_dir / "prompts.jsonl"
-    summary_path = dataset_dir / "summary.csv"
-    bad_rows_path = dataset_dir / "null_or_empty_rows.csv"
+    output_path = dataset_dir / "prompts.csv"
+    summary_path = dataset_dir / "summary.md"
+    bad_rows_path = dataset_dir / "null_or_empty_rows.md"
 
     if output_path.exists() and summary_path.exists() and not force and limit is None:
         log(f"using existing export for {dataset_id}: {output_path}")
@@ -439,17 +510,19 @@ def extract_dataset(
         raise RuntimeError(f"No sources selected for {dataset_id}")
 
     log(f"selected {len(sources)} source(s) for {dataset_id}")
-    tmp_output_path = output_path.with_suffix(".jsonl.tmp")
-    partial_output_path = output_path.with_suffix(".jsonl.partial")
+    tmp_output_path = output_path.with_suffix(".csv.tmp")
+    partial_output_path = output_path.with_suffix(".csv.partial")
     rows: list[SourceStats] = []
     total_written = 0
     limit_reached = False
 
-    with tmp_output_path.open("w", encoding="utf-8") as output_handle, (
-        bad_rows_path.open("w", encoding="utf-8", newline="")
+    with tmp_output_path.open("w", encoding="utf-8", newline="") as output_handle, (
+        bad_rows_path.open("w", encoding="utf-8")
     ) as bad_handle:
-        bad_writer = csv.DictWriter(bad_handle, fieldnames=BAD_ROW_COLUMNS)
-        bad_writer.writeheader()
+        output_writer = csv.DictWriter(output_handle, fieldnames=PROMPT_COLUMNS)
+        output_writer.writeheader()
+        bad_handle.write("# Null Or Empty Prompt Rows\n\n")
+        write_markdown_table_header(bad_handle, BAD_ROW_COLUMNS)
 
         for source in sources:
             started_time = time.time()
@@ -502,9 +575,10 @@ def extract_dataset(
                         "tools": tools,
                         "tools_source": tools_source,
                     }
+                    record.update(extract_dataset_metadata(row, dataset_id))
                     if extraction_error is not None:
                         record["extraction_error"] = extraction_error
-                    output_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    output_writer.writerow(prompt_record_to_csv_row(record))
 
                     reason = None
                     if prompt is None:
@@ -516,7 +590,9 @@ def extract_dataset(
                     if extraction_error is not None:
                         reason = "extraction_error"
                     if reason is not None:
-                        bad_writer.writerow(
+                        write_markdown_table_row(
+                            bad_handle,
+                            BAD_ROW_COLUMNS,
                             {
                                 "dataset_id": dataset_id,
                                 "config": source.config,
@@ -526,7 +602,7 @@ def extract_dataset(
                                 "prompt_source": prompt_source,
                                 "prompt_source_detail": source_detail,
                                 "extraction_error": extraction_error or "",
-                            }
+                            },
                         )
 
                     extracted_rows += 1
@@ -563,7 +639,7 @@ def extract_dataset(
                     started_at=started_at,
                     finished_at=finished_at,
                     duration_seconds=time.time() - started_time,
-                    output_jsonl=str(output_path),
+                    output_csv=str(output_path),
                     error=error,
                 )
             )
@@ -592,12 +668,9 @@ def cleanup_cache(cache_root: Path) -> None:
 
 
 def total_row_from_summary(summary_path: Path) -> dict[str, str]:
-    if not summary_path.exists():
-        return {}
-    with summary_path.open(encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row.get("config") == "__total__":
-                return row
+    for row in read_summary_rows(summary_path):
+        if row.get("config") == "__total__":
+            return row
     return {}
 
 
@@ -622,6 +695,11 @@ tags:
 - post-training
 source_datasets:
 - "{dataset_id}"
+configs:
+- config_name: default
+  data_files:
+  - split: train
+    path: prompts.csv
 ---
 
 # {repo_title}
@@ -630,11 +708,11 @@ Prompt-only extraction from `{dataset_id}`.
 
 Files:
 
-- `prompts.jsonl`: one prompt extraction record per source row. Records include
+- `prompts.csv`: one prompt extraction record per source row. Records include
   `prompt`, separated `system_prompt`, and structured `tools` when the source row
-  defines available tools.
-- `summary.csv`: source row counts, extracted row counts, count deltas, and failed prompt counts.
-- `null_or_empty_rows.csv`: row indexes where prompt extraction produced a null or empty prompt.
+  defines available tools. Nested values are JSON-encoded inside CSV cells.
+- `summary.md`: source row counts, extracted row counts, count deltas, and failed prompt counts.
+- `null_or_empty_rows.md`: row indexes where prompt extraction produced a null or empty prompt.
 
 Summary:
 
@@ -687,9 +765,9 @@ def upload_dataset(
         folder_path=dataset_dir,
         allow_patterns=[
             "README.md",
-            "prompts.jsonl",
-            "summary.csv",
-            "null_or_empty_rows.csv",
+            "prompts.csv",
+            "summary.md",
+            "null_or_empty_rows.md",
         ],
         commit_message=f"Upload prompt-only extract for {dataset_title(dataset_id)}",
     )
@@ -710,7 +788,7 @@ def upload_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export one Nemotron dataset to prompt-only JSONL."
+        description="Export one Nemotron dataset to prompt-only CSV."
     )
     parser.add_argument("--dataset", required=True, choices=sorted(DATASET_SPECS))
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -738,7 +816,7 @@ def main() -> int:
     dataset_dir = output_root / local_dataset_name(args.dataset)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     cache_root = configure_isolated_cache(output_root, args.dataset)
-    summary_path = dataset_dir / "summary.csv"
+    summary_path = dataset_dir / "summary.md"
 
     write_status(
         dataset_dir,

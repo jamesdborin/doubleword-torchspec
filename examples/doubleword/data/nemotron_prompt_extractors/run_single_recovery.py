@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import shlex
@@ -19,6 +18,7 @@ WORKER = Path(__file__).with_name("export_prompt_only_dataset.py")
 OUTPUT_ROOT = Path("/tmp/nemotron_prompt_only_exports")
 OWNER = "jamesdborin"
 COLLECTION_TITLE = "Nemotron-Post-Training-v3 Prompt-Only"
+SUMMARY_JSON_MARKER = "```json\n"
 
 DATASETS = [
     "nvidia/Nemotron-RL-Instruction-Following-Structured-Outputs-v2",
@@ -72,13 +72,24 @@ def cache_dir(dataset_id: str) -> Path:
 
 
 def summary_total(dataset_id: str) -> dict[str, str]:
-    path = dataset_dir(dataset_id) / "summary.csv"
+    path = dataset_dir(dataset_id) / "summary.md"
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row.get("config") == "__total__":
-                return row
+    text = path.read_text(encoding="utf-8")
+    start = text.find(SUMMARY_JSON_MARKER)
+    if start < 0:
+        return {}
+    start += len(SUMMARY_JSON_MARKER)
+    end = text.find("\n```", start)
+    if end < 0:
+        return {}
+    try:
+        rows = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("config") == "__total__":
+            return row
     return {}
 
 
@@ -87,7 +98,7 @@ def has_reusable_export(dataset_id: str) -> bool:
     if not row:
         return False
     return (
-        (dataset_dir(dataset_id) / "prompts.jsonl").exists()
+        (dataset_dir(dataset_id) / "prompts.csv").exists()
         and row.get("status") == "ok"
         and row.get("row_count_delta") in {"", "0"}
         and row.get("failed_prompt_rows") in {"", "0"}
@@ -104,8 +115,13 @@ def backup_and_clear_for_rerun(dataset_id: str) -> None:
     backup.mkdir(parents=True, exist_ok=True)
     for name in [
         "README.md",
-        "summary.csv",
+        "summary.md",
         "status.json",
+        "null_or_empty_rows.md",
+        "prompts.csv",
+        "prompts.csv.tmp",
+        "prompts.csv.partial",
+        "summary.csv",
         "null_or_empty_rows.csv",
         "prompts.jsonl",
         "prompts.jsonl.tmp",

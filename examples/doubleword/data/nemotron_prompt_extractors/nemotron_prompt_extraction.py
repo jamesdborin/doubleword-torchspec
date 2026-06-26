@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -18,6 +19,21 @@ from typing import Any
 DEFAULT_CONFIG = "default"
 IFBENCH_MARKERS = ("ifbench", "if_bench", "instruction_following")
 INITIAL_CONTEXT_ROLES = {"system", "developer"}
+PROMPT_COLUMNS = [
+    "dataset",
+    "config",
+    "split",
+    "row_index",
+    "prompt",
+    "prompt_source",
+    "prompt_source_detail",
+    "system_prompt",
+    "system_source",
+    "tools",
+    "tools_source",
+    "schema_str",
+    "extraction_error",
+]
 
 
 DATASET_SPECS: dict[str, dict[str, Any]] = {
@@ -456,6 +472,18 @@ def extract_dataset_metadata(row: dict[str, Any], dataset_id: str) -> dict[str, 
     return {}
 
 
+def csv_cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return value
+
+
+def prompt_record_to_csv_row(record: dict[str, Any]) -> dict[str, Any]:
+    return {column: csv_cell(record.get(column)) for column in PROMPT_COLUMNS}
+
+
 def dataset_configs(dataset_id: str, requested_config: str | None) -> list[str | None]:
     if requested_config:
         return [None if requested_config == DEFAULT_CONFIG else requested_config]
@@ -690,7 +718,9 @@ def write_prompts(
 ) -> int:
     total = 0
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PROMPT_COLUMNS)
+        writer.writeheader()
         data_files = dataset_data_files(dataset_id, requested_config, requested_split)
         if data_files:
             sources = (
@@ -712,38 +742,38 @@ def write_prompts(
 
         for config, split, rows in sources:
             for row_index, row in enumerate(rows):
-                    error = None
-                    try:
-                        prompt, source, source_detail = extract_prompt(row, dataset_id, config)
-                        tools, tools_source = extract_tools_for_source(row, source)
-                        system_prompt, system_source = extract_system_for_source(row, source)
-                    except Exception as exc:
-                        prompt, source, source_detail = None, None, None
-                        tools, tools_source = None, None
-                        system_prompt, system_source = None, None
-                        error = f"{type(exc).__name__}: {exc}"
+                error = None
+                try:
+                    prompt, source, source_detail = extract_prompt(row, dataset_id, config)
+                    tools, tools_source = extract_tools_for_source(row, source)
+                    system_prompt, system_source = extract_system_for_source(row, source)
+                except Exception as exc:
+                    prompt, source, source_detail = None, None, None
+                    tools, tools_source = None, None
+                    system_prompt, system_source = None, None
+                    error = f"{type(exc).__name__}: {exc}"
 
-                    record = {
-                        "dataset": dataset_id,
-                        "config": config,
-                        "split": split,
-                        "row_index": row_index,
-                        "prompt": prompt,
-                        "prompt_source": source,
-                        "prompt_source_detail": source_detail,
-                        "system_prompt": system_prompt,
-                        "system_source": system_source,
-                        "tools": tools,
-                        "tools_source": tools_source,
-                    }
-                    record.update(extract_dataset_metadata(row, dataset_id))
-                    if error is not None:
-                        record["extraction_error"] = error
+                record = {
+                    "dataset": dataset_id,
+                    "config": config,
+                    "split": split,
+                    "row_index": row_index,
+                    "prompt": prompt,
+                    "prompt_source": source,
+                    "prompt_source_detail": source_detail,
+                    "system_prompt": system_prompt,
+                    "system_source": system_source,
+                    "tools": tools,
+                    "tools_source": tools_source,
+                }
+                record.update(extract_dataset_metadata(row, dataset_id))
+                if error is not None:
+                    record["extraction_error"] = error
 
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    total += 1
-                    if limit is not None and total >= limit:
-                        return total
+                writer.writerow(prompt_record_to_csv_row(record))
+                total += 1
+                if limit is not None and total >= limit:
+                    return total
     return total
 
 
@@ -751,7 +781,7 @@ def build_parser(dataset_id: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract first prompts from Nemotron datasets.")
     if dataset_id is None:
         parser.add_argument("dataset", choices=sorted(DATASET_SPECS))
-    parser.add_argument("--output", required=True, type=Path, help="Destination JSONL path.")
+    parser.add_argument("--output", required=True, type=Path, help="Destination CSV path.")
     parser.add_argument("--config", help="Optional Hugging Face dataset config to extract.")
     parser.add_argument("--split", help="Optional Hugging Face split to extract.")
     parser.add_argument("--limit", type=int, help="Optional maximum rows for smoke tests.")
