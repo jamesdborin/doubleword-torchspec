@@ -29,8 +29,14 @@ DEFAULT_OUTPUT_ROOT = Path(
 )
 DEFAULT_SURVEY = Path(__file__).resolve().parent.parent / "nemotron_post_training_v3_dataset_survey.md"
 SUMMARY_JSON_MARKER = "```json\n"
+TRACKER_FILENAME = ".dashboard_progress.json"
 
 LOG_ROWS_RE = re.compile(r":\s+([0-9]+)\s+rows,\s+null=([0-9]+),\s+empty=([0-9]+),\s+errors=([0-9]+)")
+LOG_PROGRESS_RE = re.compile(
+    r"\]\s+(\S+)\s+([^/\s]+)/([^:]+):\s+"
+    r"observed=([0-9]+),\s+written=([0-9]+),\s+skipped=([0-9]+),\s+"
+    r"null=([0-9]+),\s+empty=([0-9]+),\s+errors=([0-9]+)"
+)
 LOG_EXTRACT_RE = re.compile(r"extracting\s+(\S+)\s+config=(\S+)\s+split=(\S+)\s+path=(.*)$")
 LOG_WAIT_RE = re.compile(r"waiting for a concurrency slot for (extract|upload)\s+(.+)$")
 LOG_UPLOAD_RE = re.compile(r"(uploading|creating dataset repo|added .+ to collection|released concurrency slot .* upload)")
@@ -53,6 +59,13 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text())
     except Exception:
         return {}
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp_path.replace(path)
 
 
 def read_summary_rows(path: Path) -> list[dict[str, Any]]:
@@ -86,6 +99,15 @@ def parse_int(value: Any) -> int | None:
         return int(match.group(0))
     except ValueError:
         return None
+
+
+def plausible_row_count(value: Any, expected: int | None) -> int | None:
+    parsed = parse_int(value)
+    if parsed is None:
+        return None
+    if expected is not None and parsed > expected:
+        return None
+    return parsed
 
 
 def parse_survey_counts(path: Path) -> dict[str, int]:
@@ -122,6 +144,12 @@ def tail_lines(path: Path, max_bytes: int = 128 * 1024) -> list[str]:
             handle.readline()
         data = handle.read()
     return data.decode("utf-8", errors="replace").splitlines()
+
+
+def read_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
 def line_count(path: Path) -> int | None:
@@ -193,6 +221,14 @@ def read_log_state(root: Path, dataset_id: str) -> dict[str, Any]:
             state["last_null"] = int(rows_match.group(2))
             state["last_empty"] = int(rows_match.group(3))
             state["last_errors"] = int(rows_match.group(4))
+        progress_match = LOG_PROGRESS_RE.search(line)
+        if progress_match:
+            state["last_rows"] = int(progress_match.group(5))
+            state["last_observed"] = int(progress_match.group(4))
+            state["last_skipped"] = int(progress_match.group(6))
+            state["last_null"] = int(progress_match.group(7))
+            state["last_empty"] = int(progress_match.group(8))
+            state["last_errors"] = int(progress_match.group(9))
         extracting = LOG_EXTRACT_RE.search(line)
         if extracting:
             state["current_config"] = extracting.group(2)
@@ -206,6 +242,194 @@ def read_log_state(root: Path, dataset_id: str) -> dict[str, Any]:
     return state
 
 
+def source_key(config: str, split: str, path: str = "") -> str:
+    return "\x1f".join([config, split, path])
+
+
+def merge_source(
+    sources: dict[str, dict[str, Any]],
+    *,
+    config: str,
+    split: str,
+    path: str = "",
+    observed_rows: int | None = None,
+    extracted_rows: int | None = None,
+    expected_rows: int | None = None,
+    null_rows: int | None = None,
+    empty_rows: int | None = None,
+    error_rows: int | None = None,
+    status: str = "",
+) -> None:
+    key = source_key(config, split, path)
+    row = sources.setdefault(
+        key,
+        {
+            "config": config,
+            "split": split,
+            "path": path,
+            "observed_rows": 0,
+            "extracted_rows": 0,
+            "expected_rows": None,
+            "null_rows": 0,
+            "empty_rows": 0,
+            "error_rows": 0,
+            "status": "",
+        },
+    )
+    for field, value in [
+        ("observed_rows", observed_rows),
+        ("extracted_rows", extracted_rows),
+        ("null_rows", null_rows),
+        ("empty_rows", empty_rows),
+        ("error_rows", error_rows),
+    ]:
+        if value is not None:
+            row[field] = max(parse_int(row.get(field)) or 0, value)
+    if expected_rows is not None:
+        current_expected = parse_int(row.get("expected_rows"))
+        row["expected_rows"] = max(current_expected or 0, expected_rows)
+    if status:
+        row["status"] = status
+
+
+def source_totals(sources: dict[str, dict[str, Any]]) -> dict[str, int | None]:
+    extracted = sum(parse_int(row.get("extracted_rows")) or 0 for row in sources.values())
+    observed = sum(parse_int(row.get("observed_rows")) or 0 for row in sources.values())
+    expected_values = [parse_int(row.get("expected_rows")) for row in sources.values()]
+    expected = (
+        sum(value for value in expected_values if value is not None)
+        if expected_values and all(value is not None for value in expected_values)
+        else None
+    )
+    null_rows = sum(parse_int(row.get("null_rows")) or 0 for row in sources.values())
+    empty_rows = sum(parse_int(row.get("empty_rows")) or 0 for row in sources.values())
+    error_rows = sum(parse_int(row.get("error_rows")) or 0 for row in sources.values())
+    return {
+        "extracted_rows": extracted,
+        "observed_rows": observed,
+        "expected_rows": expected,
+        "failed_prompt_rows": null_rows + empty_rows,
+        "extraction_error_rows": error_rows,
+    }
+
+
+def read_log_progress(root: Path, dataset_id: str) -> dict[str, Any]:
+    log_path = root / "logs" / f"{local_dataset_name(dataset_id)}.log"
+    sources: dict[str, dict[str, Any]] = {}
+    current_config = ""
+    current_split = ""
+    current_path = ""
+    last_line = ""
+    for line in read_lines(log_path):
+        last_line = line
+        extracting = LOG_EXTRACT_RE.search(line)
+        if extracting:
+            current_config = extracting.group(2)
+            current_split = extracting.group(3)
+            current_path = "" if extracting.group(4) == "-" else extracting.group(4)
+            merge_source(
+                sources,
+                config=current_config,
+                split=current_split,
+                path=current_path,
+            )
+            continue
+        progress = LOG_PROGRESS_RE.search(line)
+        if not progress:
+            continue
+        config = progress.group(2)
+        split = progress.group(3)
+        path = current_path if config == current_config and split == current_split else ""
+        merge_source(
+            sources,
+            config=config,
+            split=split,
+            path=path,
+            observed_rows=int(progress.group(4)),
+            extracted_rows=int(progress.group(5)),
+            null_rows=int(progress.group(7)),
+            empty_rows=int(progress.group(8)),
+            error_rows=int(progress.group(9)),
+        )
+    totals = source_totals(sources)
+    return {
+        "sources": sources,
+        "totals": totals,
+        "current_config": current_config,
+        "current_split": current_split,
+        "current_path": current_path,
+        "last_line": last_line,
+    }
+
+
+def merge_summary_progress(summary_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    sources: dict[str, dict[str, Any]] = {}
+    for row in summary_rows:
+        if row.get("config") == "__total__":
+            continue
+        merge_source(
+            sources,
+            config=str(row.get("config") or ""),
+            split=str(row.get("split") or ""),
+            path=str(row.get("source_path") or ""),
+            observed_rows=parse_int(row.get("observed_original_rows")),
+            extracted_rows=parse_int(row.get("extracted_rows")),
+            expected_rows=parse_int(row.get("original_rows_for_delta")),
+            null_rows=parse_int(row.get("null_prompt_rows")),
+            empty_rows=parse_int(row.get("empty_prompt_rows")),
+            error_rows=parse_int(row.get("extraction_error_rows")),
+            status=str(row.get("status") or ""),
+        )
+    return sources
+
+
+def read_tracker(root: Path) -> dict[str, Any]:
+    payload = read_json(root / TRACKER_FILENAME)
+    datasets = payload.get("datasets")
+    if not isinstance(datasets, dict):
+        return {"version": 1, "datasets": {}}
+    return {"version": 1, "datasets": datasets}
+
+
+def update_tracker(root: Path, datasets: list[dict[str, Any]]) -> None:
+    payload = read_tracker(root)
+    tracked = payload["datasets"]
+    for dataset in datasets:
+        dataset_id = dataset["dataset_id"]
+        current = tracked.setdefault(dataset_id, {"sources": {}})
+        current["updated_at"] = utc_now()
+        current["state"] = dataset.get("state") or current.get("state") or ""
+        current["phase"] = dataset.get("phase") or current.get("phase") or ""
+        current["upload_status"] = dataset.get("upload_status") or current.get("upload_status") or ""
+        current["extract_status"] = dataset.get("extract_status") or current.get("extract_status") or ""
+        for field in ["expected_rows", "extracted_rows", "failed_prompt_rows", "row_delta"]:
+            value = parse_int(dataset.get(field))
+            if value is not None:
+                existing = parse_int(current.get(field)) or 0
+                expected = parse_int(dataset.get("expected_rows")) or parse_int(current.get("expected_rows"))
+                if field == "extracted_rows" and expected is not None and existing > expected >= value:
+                    current[field] = value
+                else:
+                    current[field] = max(existing, value)
+        sources = current.setdefault("sources", {})
+        for key, row in (dataset.get("_tracker_sources") or {}).items():
+            existing = sources.setdefault(key, {})
+            existing.update({k: v for k, v in row.items() if k in {"config", "split", "path", "status"}})
+            for field in [
+                "observed_rows",
+                "extracted_rows",
+                "expected_rows",
+                "null_rows",
+                "empty_rows",
+                "error_rows",
+            ]:
+                value = parse_int(row.get(field))
+                if value is not None:
+                    existing[field] = max(parse_int(existing.get(field)) or 0, value)
+    payload["updated_at"] = utc_now()
+    write_json_atomic(root / TRACKER_FILENAME, payload)
+
+
 def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
     manifest_rows = read_csv(output_root / "dataset_manifest.csv")
     summary_rows = {
@@ -215,26 +439,83 @@ def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
     }
     survey_counts = parse_survey_counts(survey_path)
     active = read_active_slots(output_root)
+    tracker = read_tracker(output_root)
+    tracked_datasets = tracker["datasets"]
 
     datasets: list[dict[str, Any]] = []
     for manifest in manifest_rows:
         dataset_id = manifest["dataset_id"]
         local_dir = Path(manifest["local_output_dir"])
-        summary = summary_rows.get(dataset_id, {})
+        local_summary_rows = read_summary_rows(local_dir / "summary.md")
+        local_total = next(
+            (row for row in local_summary_rows if row.get("config") == "__total__"),
+            {},
+        )
+        summary = summary_rows.get(dataset_id, {}) or local_total
         status = read_json(local_dir / "status.json")
         log_state = read_log_state(output_root, dataset_id)
+        log_progress = read_log_progress(output_root, dataset_id)
+        tracked = tracked_datasets.get(dataset_id, {})
         prompt_path = local_dir / "prompts.csv"
         tmp_prompt_path = local_dir / "prompts.csv.tmp"
         bad_rows_path = local_dir / "null_or_empty_rows.md"
 
-        expected = parse_int(summary.get("original_rows_for_delta")) or survey_counts.get(dataset_id)
-        extracted = parse_int(summary.get("extracted_rows"))
-        if extracted is None:
-            extracted = log_state.get("last_rows") or line_count(tmp_prompt_path) or line_count(prompt_path) or 0
+        tracker_sources: dict[str, dict[str, Any]] = {}
+        for key, row in (tracked.get("sources") or {}).items():
+            if isinstance(row, dict):
+                tracker_sources[key] = dict(row)
+        for row in merge_summary_progress(local_summary_rows).values():
+            merge_source(
+                tracker_sources,
+                config=str(row.get("config") or ""),
+                split=str(row.get("split") or ""),
+                path=str(row.get("path") or ""),
+                observed_rows=parse_int(row.get("observed_rows")),
+                extracted_rows=parse_int(row.get("extracted_rows")),
+                expected_rows=parse_int(row.get("expected_rows")),
+                null_rows=parse_int(row.get("null_rows")),
+                empty_rows=parse_int(row.get("empty_rows")),
+                error_rows=parse_int(row.get("error_rows")),
+                status=str(row.get("status") or ""),
+            )
+        for row in log_progress["sources"].values():
+            merge_source(
+                tracker_sources,
+                config=str(row.get("config") or ""),
+                split=str(row.get("split") or ""),
+                path=str(row.get("path") or ""),
+                observed_rows=parse_int(row.get("observed_rows")),
+                extracted_rows=parse_int(row.get("extracted_rows")),
+                expected_rows=parse_int(row.get("expected_rows")),
+                null_rows=parse_int(row.get("null_rows")),
+                empty_rows=parse_int(row.get("empty_rows")),
+                error_rows=parse_int(row.get("error_rows")),
+                status=str(row.get("status") or ""),
+            )
+        totals = source_totals(tracker_sources)
 
-        upload_status = summary.get("upload_status") or "not_started"
-        status_phase = str(status.get("phase") or "")
-        extract_status = summary.get("status") or status_phase or "not_started"
+        expected_candidates = [
+            parse_int(summary.get("original_rows_for_delta")),
+            parse_int(summary.get("expected_original_rows")),
+            parse_int(tracked.get("expected_rows")),
+            parse_int(totals.get("expected_rows")),
+            survey_counts.get(dataset_id),
+        ]
+        expected = max((value for value in expected_candidates if value is not None), default=None)
+        raw_csv_rows = line_count(tmp_prompt_path) or line_count(prompt_path)
+        csv_rows = plausible_row_count(raw_csv_rows, expected)
+        extracted_candidates = [
+            plausible_row_count(summary.get("extracted_rows"), expected),
+            plausible_row_count(tracked.get("extracted_rows"), expected),
+            plausible_row_count(totals.get("extracted_rows"), expected),
+            log_state.get("last_rows"),
+            csv_rows,
+        ]
+        extracted = max((value for value in extracted_candidates if value is not None), default=0)
+
+        upload_status = summary.get("upload_status") or tracked.get("upload_status") or "not_started"
+        status_phase = str(status.get("phase") or tracked.get("phase") or "")
+        extract_status = summary.get("status") or tracked.get("extract_status") or status_phase or "not_started"
         active_info = active.get(dataset_id)
         is_waiting = "waiting for a concurrency slot" in log_state.get("last_line", "")
         is_rescheduled = status_phase in {
@@ -248,15 +529,15 @@ def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
             state = "failed"
         elif active_info or is_rescheduled or is_waiting:
             state = "running"
-        elif upload_status == "complete":
+        elif upload_status == "complete" or tracked.get("state") == "completed":
             state = "completed"
-        elif summary:
+        elif summary or extracted:
             state = "running"
         else:
             state = "not_started"
 
         if state == "running" and (is_rescheduled or is_waiting):
-            extracted = log_state.get("last_rows") or extracted or line_count(tmp_prompt_path) or 0
+            extracted = max(log_state.get("last_rows") or 0, extracted or 0, csv_rows or 0)
             upload_status = "pending"
 
         if state == "completed":
@@ -282,9 +563,18 @@ def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
         elif summary and upload_status != "complete":
             phase = "upload_pending"
 
-        null_rows = parse_int(summary.get("failed_prompt_rows")) or 0
-        row_delta = parse_int(summary.get("row_count_delta")) or 0
+        null_rows = max(
+            parse_int(summary.get("failed_prompt_rows")) or 0,
+            parse_int(tracked.get("failed_prompt_rows")) or 0,
+            parse_int(totals.get("failed_prompt_rows")) or 0,
+        )
+        row_delta = max(
+            parse_int(summary.get("row_count_delta")) or 0,
+            parse_int(tracked.get("row_delta")) or 0,
+        )
         has_issue = bool(row_delta or null_rows or summary.get("status") == "failed")
+        current_split = log_state.get("current_split") or log_progress.get("current_split", "")
+        current_path = log_state.get("current_path") or log_progress.get("current_path", "")
 
         datasets.append(
             {
@@ -303,17 +593,22 @@ def build_snapshot(output_root: Path, survey_path: Path) -> dict[str, Any]:
                 "row_delta": row_delta,
                 "failed_prompt_rows": null_rows,
                 "has_issue": has_issue,
-                "current_split": log_state.get("current_split", ""),
-                "current_path": log_state.get("current_path", ""),
+                "current_split": current_split,
+                "current_path": current_path,
                 "last_line": log_state.get("last_line", ""),
                 "active": active_info,
-                "started_at": summary.get("started_at") or status.get("updated_at") or "",
+                "started_at": summary.get("started_at") or status.get("updated_at") or tracked.get("updated_at") or "",
                 "finished_at": summary.get("finished_at") or "",
                 "duration_seconds": summary.get("duration_seconds") or "",
                 "output_size": human_bytes(file_size(prompt_path) or file_size(tmp_prompt_path)),
                 "bad_rows_file": str(bad_rows_path) if bad_rows_path.exists() else "",
+                "_tracker_sources": tracker_sources,
             }
         )
+
+    update_tracker(output_root, datasets)
+    for dataset in datasets:
+        dataset.pop("_tracker_sources", None)
 
     counts = {
         "completed": sum(1 for item in datasets if item["state"] == "completed"),

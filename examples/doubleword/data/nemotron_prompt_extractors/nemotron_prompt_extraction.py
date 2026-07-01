@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import json
 import os
@@ -216,9 +217,15 @@ DATASET_SPECS: dict[str, dict[str, Any]] = {
     },
     "nvidia/Nemotron-SFT-Math-v4": {
         "priority": ["messages", "problem"],
+        "data_files": [
+            {"config": DEFAULT_CONFIG, "split": "train", "path": "data/train.jsonl"},
+        ],
     },
     "nvidia/Nemotron-Math-Proofs-v2": {
         "priority": ["messages", "problem"],
+        "data_files": [
+            {"config": DEFAULT_CONFIG, "split": "train", "path": "data/train.jsonl"},
+        ],
     },
     "nvidia/Nemotron-SFT-Multilingual-v2": {
         "priority": ["messages"],
@@ -252,6 +259,9 @@ DATASET_SPECS: dict[str, dict[str, Any]] = {
     },
     "nvidia/Nemotron-RL-SysBench-v1": {
         "priority": ["responses_input", "messages"],
+        "data_files": [
+            {"config": DEFAULT_CONFIG, "split": "train", "path": "data/train.jsonl"},
+        ],
     },
     "nvidia/Nemotron-RL-CFBench-v1": {
         "priority": ["responses_input"],
@@ -279,6 +289,9 @@ DATASET_SPECS: dict[str, dict[str, Any]] = {
     },
     "nvidia/Nemotron-SFT-Math-v3": {
         "priority": ["messages", "problem"],
+        "data_files": [
+            {"config": DEFAULT_CONFIG, "split": "train", "path": "data/train.jsonl"},
+        ],
     },
 }
 
@@ -607,43 +620,101 @@ def load_jsonl_file(dataset_id: str, path: str) -> Iterable[dict[str, Any]]:
             "The Hugging Face Hub and requests packages are required to download JSONL files."
         ) from exc
 
-    local_path = download_jsonl_file(dataset_id, path, requests, hf_hub_url)
     decoder = json.JSONDecoder(strict=False)
-    with local_path.open(encoding="utf-8") as handle:
-        buffer = ""
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip() and not buffer:
-                continue
-            if "\x00" in line:
-                if buffer.strip():
-                    yield {
-                        "_raw_json_error": "NUL byte found while buffering JSON object",
-                        "_raw_json_path": path,
-                        "_raw_json_line": line_number,
-                    }
-                    buffer = ""
+    url = hf_hub_url(dataset_id, path, repo_type="dataset")
+    byte_offset = 0
+    line_number = 0
+    json_buffer = ""
+    text_buffer = ""
+    text_decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def parse_line(line: str) -> Iterable[dict[str, Any]]:
+        nonlocal json_buffer, line_number
+        line_number += 1
+        if not line.strip() and not json_buffer:
+            return
+        if "\x00" in line:
+            if json_buffer.strip():
                 yield {
-                    "_raw_json_error": "NUL byte found in JSONL record",
+                    "_raw_json_error": "NUL byte found while buffering JSON object",
                     "_raw_json_path": path,
                     "_raw_json_line": line_number,
                 }
-                continue
-            buffer += line
-            while buffer:
-                stripped = buffer.lstrip()
-                if not stripped:
-                    buffer = ""
+                json_buffer = ""
+            yield {
+                "_raw_json_error": "NUL byte found in JSONL record",
+                "_raw_json_path": path,
+                "_raw_json_line": line_number,
+            }
+            return
+        json_buffer += line
+        while json_buffer:
+            stripped = json_buffer.lstrip()
+            if not stripped:
+                json_buffer = ""
+                break
+            try:
+                row, end = decoder.raw_decode(stripped)
+            except json.JSONDecodeError as exc:
+                if exc.pos >= len(stripped) - 1 or "Unterminated string" in exc.msg:
                     break
-                try:
-                    row, end = decoder.raw_decode(stripped)
-                except json.JSONDecodeError as exc:
-                    if exc.pos >= len(stripped) - 1 or "Unterminated string" in exc.msg:
-                        break
-                    raise
-                yield row
-                buffer = stripped[end:]
-        if buffer.strip():
-            yield decoder.decode(buffer)
+                raise
+            yield row
+            json_buffer = stripped[end:]
+
+    for attempt in range(25):
+        headers = {"Range": f"bytes={byte_offset}-"} if byte_offset else {}
+        try:
+            with requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                allow_redirects=True,
+                timeout=(30, 120),
+            ) as response:
+                if byte_offset and response.status_code != 206:
+                    raise RuntimeError(
+                        f"Expected HTTP 206 while resuming {path} at byte {byte_offset}, "
+                        f"got {response.status_code}"
+                    )
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                    if not chunk:
+                        continue
+                    byte_offset += len(chunk)
+                    text_buffer += text_decoder.decode(chunk)
+                    lines = text_buffer.splitlines(keepends=True)
+                    if lines and not lines[-1].endswith(("\n", "\r")):
+                        text_buffer = lines.pop()
+                    else:
+                        text_buffer = ""
+                    for line in lines:
+                        yield from parse_line(line)
+                break
+        except (
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ReadTimeout,
+        ):
+            time.sleep(min(60, 2 ** attempt))
+            continue
+    else:
+        raise RuntimeError(f"Failed to stream {path} after repeated reconnects")
+
+    text_buffer += text_decoder.decode(b"", final=True)
+    if text_buffer:
+        yield from parse_line(text_buffer)
+    if json_buffer.strip():
+        yield decoder.decode(json_buffer)
+
+
+def cleanup_download_parts(parts_dir: Path) -> None:
+    shutil.rmtree(parts_dir, ignore_errors=True)
+
+
+def cleanup_partial_downloads(local_path: Path, parts_dir: Path) -> None:
+    local_path.with_suffix(local_path.suffix + ".tmp").unlink(missing_ok=True)
+    cleanup_download_parts(parts_dir)
 
 
 def load_parquet_file(dataset_id: str, path: str) -> Iterable[dict[str, Any]]:
@@ -681,7 +752,9 @@ def download_jsonl_file(
     url = head.url
 
     if local_path.exists() and local_path.stat().st_size == total_size:
+        cleanup_download_parts(parts_dir)
         return local_path
+    cleanup_partial_downloads(local_path, parts_dir)
 
     chunk_size = 64 * 1024 * 1024
     chunks = [
@@ -726,11 +799,14 @@ def download_jsonl_file(
     tmp_local = local_path.with_suffix(local_path.suffix + ".tmp")
     with tmp_local.open("wb") as output:
         for index, _, _ in chunks:
-            with (parts_dir / f"{index:06d}.part").open("rb") as part:
+            part_path = parts_dir / f"{index:06d}.part"
+            with part_path.open("rb") as part:
                 shutil.copyfileobj(part, output, length=8 * 1024 * 1024)
+            part_path.unlink(missing_ok=True)
     if tmp_local.stat().st_size != total_size:
         raise RuntimeError(f"Downloaded size mismatch for {path}")
     tmp_local.replace(local_path)
+    cleanup_download_parts(parts_dir)
     return local_path
 
 
