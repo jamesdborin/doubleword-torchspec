@@ -1,0 +1,96 @@
+# DFlash training config for OpenAI GPT-OSS-20B target model
+#
+# GPU allocation (2x GPU):
+#   - 1 GPU for inference (SGLang engine, tp_size=1)
+#   - 1 GPU for training
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/sglang_gpt_oss_20b_dflash.yaml
+
+model:
+  target_model_path: openai/gpt-oss-20b
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dflash_draft_config_gpt_oss_20b.json
+
+dataset:
+  # Local cleaned and Harmony-normalized copy of jamesdborin/100k-GPT-OSS/data/gpt-oss-20b.jsonl.
+  train_data_path: ../examples/doubleword/data/100k-GPT-OSS/gpt-oss-20b.harmony.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: gpt-oss
+  prompt_key: conversations
+  min_loss_tokens: 32
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 2048
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 2
+  warmup_ratio: 0.04
+
+  # DFlash-specific parameters
+  dflash_block_size: 16
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 5
+
+inference:
+  inference_engine_type: sgl
+  store_last_hidden_states: false
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
+    extra_args:
+      context_length: 2056
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  # Hard-pin: master-side TTL is disabled; we rely on explicit
+  # batch_remove(force=True) (see mooncake/eagle_store.py). Requires
+  # mooncake-transfer-engine >= 0.3.10.post1.
+  enable_hard_pin: true
+
+logging:
+  report_to: wandb
+  wandb_project: gpt-oss-20b-dflash
+  wandb_group: null
+  wandb_team: null
+  wandb_mode: online
+  wandb_random_suffix: true
+  # Put your Weights & Biases API key here, or leave this null and set WANDB_API_KEY.
+  wandb_key: "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"
+
+output_dir: ./outputs/gpt-oss-20b-dflash
+cache_dir: ./cache/gpt-oss-20b-dflash
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

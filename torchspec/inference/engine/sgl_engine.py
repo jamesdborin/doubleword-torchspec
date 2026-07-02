@@ -44,8 +44,7 @@ from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
 # Keys that users might plausibly put in extra_args but are managed by
-# TorchSpec.  Used only to emit a warning — the actual protection comes
-# from the .update() ordering in init() which overwrites extra_args.
+# TorchSpec. Used to emit a warning and drop values that TorchSpec must own.
 _PROTECTED_ENGINE_KEYS = frozenset(
     {
         "model_path",
@@ -58,7 +57,6 @@ _PROTECTED_ENGINE_KEYS = frozenset(
         "dist_timeout",
         "enable_multimodal",
         "allow_auto_truncate",
-        "context_length",
     }
 )
 
@@ -276,7 +274,6 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 "trust_remote_code": getattr(self.args, "trust_remote_code", True),
                 "chunked_prefill_size": -1,
                 "allow_auto_truncate": True,
-                **({"context_length": max_seq_length} if max_seq_length else {}),
                 **(
                     {"spec_training_store_last_hidden_states": False}
                     if not self._store_last_hidden_states
@@ -284,6 +281,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 ),
             }
         )
+        if max_seq_length:
+            engine_kwargs.setdefault("context_length", max_seq_length)
 
         # Decode mode: add speculative decoding and performance tuning params
         self._train_with_decode = getattr(self.args, "train_with_decode", False)
