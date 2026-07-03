@@ -1,0 +1,105 @@
+# TorchSpec config adapted from the upstream Speculators run:
+# examples/train/dflash_qwen3_8b_sharegpt_online_5k.sh
+#
+# Upstream run summary:
+#   - target model: Qwen/Qwen3-8B
+#   - dataset: ShareGPT, capped to 5k samples during preprocessing
+#   - sequence length: 8192
+#   - epochs: 5
+#   - learning rate: 3e-4
+#   - DFlash: block_size=8, max_anchors=3072, draft decoder layers=5
+#   - target hidden-state layers: [2, 18, 33]
+#   - GPUs: 2 vLLM GPUs + 2 training GPUs
+#
+# Local adaptation:
+#   - backend: SGLang instead of vLLM
+#   - hardware: 2 GPUs total
+#   - placement: 1 GPU for SGLang inference + 1 GPU for training
+#   - global_batch = micro_batch_size x dp_size x accum = 1 x 1 x 1 = 1
+#
+# TorchSpec notes:
+#   - Point dataset.train_data_path at a ShareGPT-format JSON/JSONL containing
+#     the same 5k-sample subset, or override it from the CLI.
+#   - The upstream --draft-vocab-size 32000 is not represented here because
+#     TorchSpec DFlash currently uses the full target vocabulary.
+#
+# Usage:
+#   python -m torchspec.train_entry \
+#     --config configs/sglang_qwen3_8b_dflash_sharegpt_online_5k_2gpu.yaml \
+#     dataset.train_data_path=/path/to/sharegpt_5k.jsonl
+
+model:
+  target_model_path: Qwen/Qwen3-8B  # workload MODEL="Qwen/Qwen3-8B"
+  trust_remote_code: true
+  # Uses a workload-matched DFlash draft shape: 5 decoder layers and target layers [2, 18, 33].
+  draft_model_config: torchspec/config/dflash_draft_config_qwen3_8b_sharegpt_online_5k.json
+  target_model_backend: sglang  # local adaptation: SGLang backend
+
+dataset:
+  # workload DATASET="sharegpt" + MAX_SAMPLES=5000; provide the preselected/preprocessed 5k subset here.
+  train_data_path: ???  # set to a 5k ShareGPT-format JSON/JSONL
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: qwen  # Qwen chat formatting for the target model tokenizer
+  prompt_key: conversations  # expected ShareGPT-style conversation field
+  min_loss_tokens: 16  # DFlash validation requires >= 2 * dflash_block_size (= 16)
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 3e-4  # workload LR=3e-4
+  min_lr: 0.0
+  weight_decay: 0.0
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 8192  # workload SEQ_LENGTH=8192
+  num_epochs: 5  # workload EPOCHS=5
+  seed: 0
+  placement_strategy: inference_first  # local adaptation: GPU 0 for SGLang, GPU 1 for training
+  training_num_gpus_per_node: 1  # local adaptation: one GPU reserved for training
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: REPLICATE  # single training GPU, so no FSDP sharding is needed
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 2
+  warmup_ratio: 0.015
+
+  dflash_block_size: 8  # workload BLOCK_SIZE=8
+  dflash_num_anchors: 3072  # workload MAX_ANCHORS=3072
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 3  # workload TARGET_LAYER_IDS has 3 layers: "2 18 33"
+
+inference:
+  inference_engine_type: sgl  # local adaptation: use SGLang for online hidden states
+  aux_hidden_states_layers: [2, 18, 33]  # workload TARGET_LAYER_IDS="2 18 33"
+  store_last_hidden_states: false
+  inference_num_gpus: 1  # local adaptation: one GPU reserved for inference
+  inference_num_gpus_per_engine: 1  # one single-GPU SGLang engine
+  inference_num_gpus_per_node: 2  # local adaptation: 2-GPU node
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1  # one single-GPU SGLang engine
+    mem_fraction_static: 0.7
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+output_dir: ./output/dflash_qwen3_8b_sharegpt_sglang_2gpu
+cache_dir: ./cache/dflash_qwen3_8b_sharegpt_sglang_2gpu
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
