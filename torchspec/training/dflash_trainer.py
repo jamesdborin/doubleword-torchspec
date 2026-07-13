@@ -52,6 +52,7 @@ class DFlashTrainer(Trainer):
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
+        self.use_liger_kernel = getattr(args, "use_liger_kernel", True)
 
     def init_model(
         self,
@@ -128,6 +129,7 @@ class DFlashTrainer(Trainer):
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
             loss_decay_gamma=self.loss_decay_gamma,
+            use_liger_kernel=self.use_liger_kernel,
         )
 
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}

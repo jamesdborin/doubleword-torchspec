@@ -6,7 +6,7 @@
 #   - global_batch = micro_batch_size × dp_size × accum = 1 × 3 × 2 = 6
 
 model:
-  target_model_path: Qwen/Qwen3-8B
+  target_model_path: Qwen/Qwen3.5-9B
   trust_remote_code: true
   draft_model_config: torchspec/config/dflash_draft_config.json
 

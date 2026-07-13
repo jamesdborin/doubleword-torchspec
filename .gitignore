@@ -80,6 +80,7 @@ Thumbs.db
 
 # Logs
 *.log
+*.jsonl
 cache/
 outputs/
 running_logs/
@@ -89,3 +90,4 @@ wandb/log.txt
 
 .claude/
 wandb/
+data/ShareGPT_V3_unfiltered_cleaned_split.json

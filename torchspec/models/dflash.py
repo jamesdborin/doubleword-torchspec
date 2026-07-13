@@ -33,6 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
+from torchspec.models.ops.liger import is_liger_available, make_liger_fused_linear_ce
 from torchspec.utils.logging import logger
 
 _VALID_DFLASH_LOSS_OBJECTIVES = {"decay", "dpace"}
@@ -109,6 +110,7 @@ class DFlashModel(nn.Module):
         loss_objective: str = "decay",
         dpace_alpha: float = 0.5,
         loss_decay_gamma: float = 7.0,
+        use_liger_kernel: bool = True,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -126,6 +128,169 @@ class DFlashModel(nn.Module):
         self.loss_objective = loss_objective
         self.dpace_alpha = dpace_alpha
         self.loss_decay_gamma = loss_decay_gamma
+        self.use_liger_kernel = use_liger_kernel
+        self._liger_fused_linear_ce = None
+        self._liger_unavailable_logged = False
+
+    def _get_lm_head_weight_bias(
+        self,
+        lm_head_weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        if hasattr(self.draft_model, "lm_head"):
+            lm_head = self.draft_model.lm_head
+            return lm_head.weight, getattr(lm_head, "bias", None)
+        return lm_head_weight, None
+
+    def _get_liger_fused_linear_ce(self):
+        if self._liger_fused_linear_ce is None:
+            self._liger_fused_linear_ce = make_liger_fused_linear_ce(
+                reduction="sum",
+                return_token_accuracy=True,
+                accum_dtype=torch.float32,
+            )
+        return self._liger_fused_linear_ce
+
+    def _can_use_liger_loss(self, device: torch.device) -> bool:
+        if not self.use_liger_kernel:
+            return False
+        if self.loss_objective != "decay":
+            return False
+        if device.type != "cuda":
+            return False
+        if is_liger_available():
+            return True
+        if not self._liger_unavailable_logged:
+            logger.warning("Liger-Kernel is not available; using PyTorch DFlash CE loss.")
+            self._liger_unavailable_logged = True
+        return False
+
+    def _compute_torch_loss(
+        self,
+        draft_hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
+        binary_eval_mask: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, n_blocks, _ = target_ids.shape
+        device = draft_hidden.device
+
+        lm_weight, lm_bias = self._get_lm_head_weight_bias(lm_head_weight)
+        logits = F.linear(draft_hidden, lm_weight, lm_bias)
+
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_targets = target_ids.view(-1)
+        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        loss_per_token_by_position = loss_per_token.view(bsz, n_blocks, self.block_size)
+
+        objective_weights = weight_mask
+        if (
+            self.loss_objective == "decay"
+            and self.loss_decay_gamma is not None
+            and self.loss_decay_gamma > 0
+        ):
+            # Loss decay: exp(-(k-1)/gamma) so k=1 gets weight 1.0.
+            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
+            objective_weights = weight_mask * decay_weights
+        elif self.loss_objective == "dpace":
+            dpace_weights = torch.ones_like(weight_mask)
+            if self.block_size > 1:
+                with torch.no_grad():
+                    target_confidences = torch.exp(-loss_per_token_by_position[..., 1:].float())
+                    dpace_pred_weights = _dpace_position_weights(
+                        target_confidences,
+                        self.dpace_alpha,
+                    ).to(dtype=weight_mask.dtype)
+                dpace_weights[..., 1:] = dpace_pred_weights
+            objective_weights = weight_mask * dpace_weights
+
+        flat_weights = objective_weights.view(-1)
+        valid_token_count = flat_weights.sum().clamp(min=1e-6)
+        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+
+        with torch.no_grad():
+            pred_ids = torch.argmax(flat_logits, dim=-1)
+            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+            actual_token_count = binary_eval_mask.sum().clamp(min=1e-6)
+            accuracy = correct.sum().float() / actual_token_count
+
+            binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size)
+            count_per_position = binary_weights.sum(dim=(0, 1))
+            count_per_pos = count_per_position.clamp(min=1.0)
+
+            loss_per_position = (
+                loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
+            ).sum(dim=(0, 1)) / count_per_pos
+            acc_per_position = (correct.view(bsz, n_blocks, self.block_size).float()).sum(
+                dim=(0, 1)
+            ) / count_per_pos
+
+        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+
+    def _compute_liger_decay_loss(
+        self,
+        draft_hidden: torch.Tensor,
+        target_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
+        binary_eval_mask: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the static-decay CE objective with Liger fused linear CE."""
+        bsz, n_blocks, _ = target_ids.shape
+        device = draft_hidden.device
+        lm_weight, lm_bias = self._get_lm_head_weight_bias(lm_head_weight)
+        liger_loss = self._get_liger_fused_linear_ce()
+
+        flat_hidden = draft_hidden.reshape(-1, draft_hidden.size(-1))
+        flat_targets = target_ids.reshape(-1)
+        binary_by_position = binary_eval_mask.view(bsz, n_blocks, self.block_size)
+        block_offsets = torch.arange(bsz * n_blocks, device=device) * self.block_size
+
+        loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        weighted_count = torch.zeros((), dtype=torch.float32, device=device)
+        count_per_position = torch.zeros(self.block_size, dtype=torch.float32, device=device)
+        loss_per_position = torch.zeros(self.block_size, dtype=torch.float32, device=device)
+        acc_per_position = torch.zeros(self.block_size, dtype=torch.float32, device=device)
+
+        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+            k = torch.arange(self.block_size, device=device)
+            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
+        else:
+            decay_weights = torch.ones(self.block_size, dtype=torch.float32, device=device)
+
+        for pos in range(self.block_size):
+            valid_mask = binary_by_position[..., pos].reshape(-1) > 0.5
+            count = valid_mask.sum()
+            if count.item() == 0:
+                continue
+
+            block_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+            valid_idx = block_offsets.index_select(0, block_idx) + pos
+            hidden = flat_hidden.index_select(0, valid_idx).contiguous()
+            targets = flat_targets.index_select(0, valid_idx).contiguous()
+            result = liger_loss(lm_weight, hidden, targets, bias=lm_bias)
+
+            ce_sum = result.loss.float() if hasattr(result, "loss") else result.float()
+            token_accuracy = (
+                result.token_accuracy.float()
+                if hasattr(result, "token_accuracy") and result.token_accuracy is not None
+                else torch.zeros((), dtype=torch.float32, device=device)
+            )
+
+            count_f = count.to(dtype=torch.float32)
+            objective_weight = decay_weights[pos]
+            loss_sum = loss_sum + ce_sum * objective_weight
+            weighted_count = weighted_count + count_f * objective_weight
+            count_per_position[pos] = count_f
+            loss_per_position[pos] = ce_sum / count_f.clamp(min=1.0)
+            acc_per_position[pos] = token_accuracy
+
+        loss = loss_sum / weighted_count.clamp(min=1e-6)
+        actual_token_count = count_per_position.sum().clamp(min=1e-6)
+        accuracy = (acc_per_position * count_per_position).sum() / actual_token_count
+
+        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
 
     def _sample_anchor_positions(
         self,
@@ -311,14 +476,7 @@ class DFlashModel(nn.Module):
             noise_embedding=noise_embedding,
         )
 
-        # 7. Compute logits via frozen LM head
-        logits = (
-            self.draft_model.lm_head(draft_hidden)
-            if hasattr(self.draft_model, "lm_head")
-            else F.linear(draft_hidden, lm_head_weight)
-        )
-
-        # 8. Compute labels and weight mask (SpecForge pattern)
+        # 7. Compute labels and weight mask (SpecForge pattern)
         # Labels: same-position prediction (position k predicts token at anchor+k)
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets  # [B, n_blocks, block_size]
@@ -352,57 +510,19 @@ class DFlashModel(nn.Module):
         # our objective weighting is an addition to the training signal, not the metric.
         binary_eval_mask = weight_mask.view(-1)
 
-        # 9. Cross entropy loss
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = target_ids.view(-1)
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        loss_per_token_by_position = loss_per_token.view(bsz, n_blocks, self.block_size)
+        if self._can_use_liger_loss(device):
+            return self._compute_liger_decay_loss(
+                draft_hidden=draft_hidden,
+                target_ids=target_ids,
+                weight_mask=weight_mask,
+                binary_eval_mask=binary_eval_mask,
+                lm_head_weight=lm_head_weight,
+            )
 
-        objective_weights = weight_mask
-        if (
-            self.loss_objective == "decay"
-            and self.loss_decay_gamma is not None
-            and self.loss_decay_gamma > 0
-        ):
-            # Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
-            objective_weights = weight_mask * decay_weights
-        elif self.loss_objective == "dpace":
-            dpace_weights = torch.ones_like(weight_mask)
-            if self.block_size > 1:
-                with torch.no_grad():
-                    target_confidences = torch.exp(-loss_per_token_by_position[..., 1:].float())
-                    dpace_pred_weights = _dpace_position_weights(
-                        target_confidences,
-                        self.dpace_alpha,
-                    ).to(dtype=weight_mask.dtype)
-                dpace_weights[..., 1:] = dpace_pred_weights
-            objective_weights = weight_mask * dpace_weights
-
-        flat_weights = objective_weights.view(-1)
-        valid_token_count = flat_weights.sum().clamp(min=1e-6)
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
-
-        # 10. Accuracy (using binary mask without decay)
-        with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum().clamp(min=1e-6)
-            accuracy = correct.sum().float() / actual_token_count
-
-            # Per-position-within-block metrics (index 0 = anchor, masked out;
-            # indices 1..block_size-1 correspond to 1..B-1 tokens past the anchor).
-            # Matches Eagle3's per-TTT-position breakdown semantically.
-            binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size)
-            count_per_position = binary_weights.sum(dim=(0, 1))
-            count_per_pos = count_per_position.clamp(min=1.0)
-
-            loss_per_position = (
-                loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
-            ).sum(dim=(0, 1)) / count_per_pos
-            acc_per_position = (correct.view(bsz, n_blocks, self.block_size).float()).sum(
-                dim=(0, 1)
-            ) / count_per_pos
-
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+        return self._compute_torch_loss(
+            draft_hidden=draft_hidden,
+            target_ids=target_ids,
+            weight_mask=weight_mask,
+            binary_eval_mask=binary_eval_mask,
+            lm_head_weight=lm_head_weight,
+        )

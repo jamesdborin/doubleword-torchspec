@@ -28,6 +28,7 @@ dependencies = [
     "omegaconf",
     "ray",
     "numba",
+    "liger-kernel>=0.8.0",
 ]
 
 [tool.setuptools]

@@ -1,0 +1,107 @@
+# DFlash training config for Qwen3.5-9B on 2x H100.
+#
+# Adapted from the Speculators torchrun command:
+#   - target model: Qwen/Qwen3.5-9B
+#   - dataset: jamesdborin/qwen9B-500k-ultrachat-magpie
+#   - sequence length: 8192
+#   - epochs: 3
+#   - learning rate: 6e-4
+#   - DFlash: 5 draft layers, max_anchors=3072
+#   - 2 GPUs total: 1 SGLang inference GPU + 1 training GPU
+#
+# Notes:
+#   - Qwen3.5-9B currently has 32 text layers, so the 8B command's final
+#     target layer id 34 is out of range. This config uses [2, 9, 16, 23, 30].
+#   - The upstream --draft-vocab-size 32000 is not represented here because
+#     TorchSpec DFlash uses the target vocabulary.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=2,3 python -m torchspec.train_entry \
+#     --config configs/sglang_qwen35_9b_dflash_ultrachat_magpie_2gpu.yaml
+
+model:
+  target_model_path: Qwen/Qwen3.5-9B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dflash_draft_config_qwen35_9b_ultrachat_magpie.json
+  target_model_backend: sglang
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+
+dataset:
+  train_data_path: jamesdborin/qwen9B-500k-ultrachat-magpie
+  eval_data_path: null
+  eval_interval: 500
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 16
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 8192
+  num_epochs: 3
+  seed: 42
+  placement_strategy: inference_first
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: REPLICATE
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 2000
+  save_per_epoch: true
+  max_checkpoints: 3
+  warmup_ratio: 0.04
+
+  dflash_block_size: 8
+  dflash_num_anchors: 3072
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 5
+
+inference:
+  inference_engine_type: sgl
+  aux_hidden_states_layers: [2, 9, 16, 23, 30]
+  store_last_hidden_states: false
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 2
+  max_sample_pool_size: 128
+  inference_buffer_threshold: 64
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
+    extra_args:
+      context_length: 8200
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+logging:
+  report_to: wandb
+  wandb_project: qwen35-9b-dflash
+  wandb_group: ultrachat-magpie-2gpu
+  wandb_team: null
+  wandb_mode: online
+  wandb_random_suffix: true
+  wandb_key: null
+
+output_dir: ./outputs/qwen35-9b-dflash-ultrachat-magpie-2gpu
+cache_dir: ./cache/qwen35-9b-dflash-ultrachat-magpie-2gpu
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

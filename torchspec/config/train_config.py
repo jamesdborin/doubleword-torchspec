@@ -153,6 +153,7 @@ class TrainingConfig:
     dflash_loss_objective: str = "decay"  # "decay" or "dpace"
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
+    use_liger_kernel: bool = True
 
 
 @dataclass
