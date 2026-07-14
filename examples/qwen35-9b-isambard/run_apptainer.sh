@@ -67,6 +67,7 @@ apptainer exec --nv \
           training.draft_accumulation_steps=1 \
           training.dflash_num_anchors=256 \
           training.use_liger_kernel=true \
+          dataset.num_proc=8 \
           inference.max_sample_pool_size=32 \
           inference.inference_buffer_threshold=16 \
           output_dir='"$WORK"'/outputs/qwen35-9b-dflash-ultrachat-liger-a256-b8-a1 \

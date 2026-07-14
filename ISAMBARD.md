@@ -78,3 +78,8 @@ second full-node allocation.
   the 13 GB reusable layer cache exceeded scratch quota. Persistent blobs and
   the final SIF remain on scratch; Slurm builds now use short-lived node-local
   `/tmp/apptainer-$SLURM_JOB_ID` for extraction.
+- Retry job `5653798` built and cached the 11 GB SIF successfully, created W&B
+  run `f4jihu3j`, started Ray/Mooncake with the correct 1+1 GPU placement, and
+  loaded all 500,000 rows. It then OOM-killed during tokenization because the
+  previous hard-coded default spawned 64 tokenizer processes. Dataset worker
+  count is now a structured config field, and Isambard caps it at 8.
