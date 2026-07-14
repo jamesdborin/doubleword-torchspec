@@ -1,6 +1,6 @@
 --- qwen3_vl.py
 +++ qwen3_vl.py
-@@ -1392,7 +1392,13 @@
+@@ -1406,7 +1406,13 @@
                  num_layers - 3,
              ]  # Specific layers for EAGLE3 support
          else:
@@ -13,5 +13,5 @@
 +            else:
 +                self.model.layers_to_capture = shifted_layer_ids
 
-     def get_embed_and_head(self):
-         return self.model.embed_tokens.weight, self.lm_head.weight
+
+ EntryClass = Qwen3VLForConditionalGeneration
