@@ -65,3 +65,8 @@ second full-node allocation.
 - Slurm rejected the initial 72-hour training request with
   `QOSMaxWallDurationPerJobLimit`. `sbatch --test-only` confirmed that 24 hours
   is accepted for this account, so the committed training wall time is 24h.
+- Submitted training job `5653206`. Slurm accepted it with four GPUs and a
+  24-hour wall time; it initially entered `PENDING (Priority)`.
+- Liger preparation checks the image and persistent dependency layer first. If
+  installation is required it uses `--no-deps`, avoiding a duplicate PyTorch
+  and CUDA stack under scratch.

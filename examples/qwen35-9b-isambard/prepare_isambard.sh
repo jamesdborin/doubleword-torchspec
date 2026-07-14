@@ -15,9 +15,14 @@ if [[ ! -s "$IMAGE" ]]; then
 fi
 
 # Keep additions missing from the published image in a persistent scratch target.
-apptainer exec --bind "$WORK:$WORK" "$IMAGE" \
-    python3 -m pip install --no-cache-dir --target "$WORK/container-pydeps" \
-    'liger-kernel>=0.8.0'
+# The image already owns PyTorch/CUDA dependencies, so never duplicate them here.
+if ! APPTAINERENV_PYTHONPATH="$WORK/container-pydeps" \
+    apptainer exec --bind "$WORK:$WORK" "$IMAGE" \
+    python3 -c 'import liger_kernel'; then
+    apptainer exec --bind "$WORK:$WORK" "$IMAGE" \
+        python3 -m pip install --no-cache-dir --no-deps \
+        --target "$WORK/container-pydeps" 'liger-kernel>=0.8.0'
+fi
 
 echo "Prepared persistent runtime at $WORK"
 echo "Image: $IMAGE"
