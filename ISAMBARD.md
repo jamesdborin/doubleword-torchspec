@@ -56,4 +56,6 @@ The first interactive image build attempt downloaded all OCI layers but the
 login-node process disappeared during extraction before producing the SIF. The
 downloaded layers remained reusable in the scratch Apptainer cache. Image
 assembly was therefore moved to `prepare.sbatch` so it runs on an allocated
-compute node.
+compute node. The preparation job requests one GPU because CPU-only jobs remain
+unscheduled at minimum priority on Isambard's GPU `workq`; the image build does
+not otherwise use that GPU.
