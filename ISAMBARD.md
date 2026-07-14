@@ -113,3 +113,14 @@ second full-node allocation.
   GPUs. The launcher now defaults to FSDP2 `FULL_SHARD`, three training ranks,
   and micro-batch 8 (global batch 24), with environment knobs for repeatable
   batch-size probes and a `REPLICATE` data-parallel fallback.
+- Scaled the node to Ray bundles `[1,2,3]` for training and GPU `0` for
+  inference. FSDP2 logs confirm `FULL_SHARD` on all three training ranks.
+- Batch-size search results (per-rank micro-batch; global batch is 3x): 8/24
+  passed five steps; 16/48 passed three; 20/60 passed five; 22/66 passed two;
+  23/69 passed step 1 then OOMed on step 2; 24, 25, 26, 28, and 32 OOMed.
+  Therefore 22 is the largest tested multi-step-stable micro-batch, giving
+  global batch 66 with accumulation 1.
+- Larger pools initially deadlocked below one global batch or exhausted the
+  16 GiB Mooncake segment when doubled. The launcher now sizes the inference
+  pool and threshold to exactly one global batch. It also enables expandable
+  CUDA allocator segments to reduce fragmentation.
