@@ -108,3 +108,8 @@ second full-node allocation.
   showed state `running`, `train/step=6`, `train/avg_loss=12.977486610412598`,
   and performance timing metrics. This is the first fully successful Isambard
   launch of the replicated run.
+- At the user's request, cancelled job `5654710` after confirming the two-GPU
+  launch. Began scaling the same node to one inference GPU plus three training
+  GPUs. The launcher now defaults to FSDP2 `FULL_SHARD`, three training ranks,
+  and micro-batch 8 (global batch 24), with environment knobs for repeatable
+  batch-size probes and a `REPLICATE` data-parallel fallback.

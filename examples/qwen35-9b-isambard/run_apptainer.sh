@@ -35,9 +35,16 @@ export TORCHINDUCTOR_CACHE_DIR="$WORK/torchinductor"
 export TORCHSPEC_LOG_DIR="$WORK/logs"
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
 export MC_STORE_MEMCPY="${MC_STORE_MEMCPY:-0}"
-# Isambard schedules whole four-GPU nodes. Preserve the source run's two-GPU
-# topology by exposing exactly one inference GPU and one training GPU.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+# Isambard schedules whole four-GPU nodes. Use one GPU for inference and the
+# remaining three for training by default.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+
+TRAIN_GPUS="${TRAIN_GPUS:-3}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
+FSDP_STRATEGY="${FSDP_STRATEGY:-FULL_SHARD}"
+NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-}"
+RUN_SUFFIX="${RUN_SUFFIX:-3train-fsdp-mbs${MICRO_BATCH_SIZE}}"
+TRAIN_STEP_ARG="${NUM_TRAIN_STEPS:+training.num_train_steps=$NUM_TRAIN_STEPS}"
 
 # Ray Unix sockets have a 107-byte path limit, so keep these paths node-local and short.
 export TMPDIR="/tmp/ts-${SLURM_JOB_ID:-manual}"
@@ -72,14 +79,17 @@ apptainer exec --nv \
         cd /workspace/TorchSpec
         python3 -m torchspec.train_entry \
           --config configs/sglang_qwen35_9b_dflash_ultrachat_magpie_2gpu.yaml \
-          training.micro_batch_size=8 \
+          training.training_num_gpus_per_node='"$TRAIN_GPUS"' \
+          training.fsdp_strategy='"$FSDP_STRATEGY"' \
+          training.micro_batch_size='"$MICRO_BATCH_SIZE"' \
           training.draft_accumulation_steps=1 \
           training.dflash_num_anchors=256 \
           training.use_liger_kernel=true \
           dataset.num_proc=8 \
           inference.max_sample_pool_size=32 \
           inference.inference_buffer_threshold=16 \
-          output_dir='"$WORK"'/outputs/qwen35-9b-dflash-ultrachat-liger-a256-b8-a1 \
+          output_dir='"$WORK"'/outputs/qwen35-9b-dflash-ultrachat-liger-a256-'"$RUN_SUFFIX"' \
           cache_dir='"$WORK"'/cache/qwen35-9b-dflash-ultrachat-liger-a256-b16 \
-          model_download_dir='"$WORK"'/hf-cache
+          model_download_dir='"$WORK"'/hf-cache \
+          '"$TRAIN_STEP_ARG"'
     '
