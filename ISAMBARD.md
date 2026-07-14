@@ -96,3 +96,15 @@ second full-node allocation.
   to Qwen3.5's per-layer capture setter while leaving the cached SIF immutable.
 - Corrected the patch hunk length after the first dry-run validation caught a
   malformed unified-diff header; no training job was submitted with that draft.
+- Submitted retry job `5654710` with reservation `brics_s6p`; it started on
+  `nid010318` and reused the persistent 11 GB SIF, Qwen3.5-9B weights, and the
+  500,000-row tokenized dataset cache.
+- The patched SGLang Qwen3.5 auxiliary-state path passed the previous first-
+  inference failure. The job completed its first optimizer step at 16:55:28
+  and continued through at least step 15 while this log was updated. The first
+  step reported loss 12.856; step 15 reported loss 11.395.
+- W&B run `rh12fzxc` is live and receiving optimizer metrics at
+  <https://wandb.ai/doubleword/qwen35-9b-dflash/runs/rh12fzxc>. API verification
+  showed state `running`, `train/step=6`, `train/avg_loss=12.977486610412598`,
+  and performance timing metrics. This is the first fully successful Isambard
+  launch of the replicated run.
