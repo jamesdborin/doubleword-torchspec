@@ -38,9 +38,8 @@ On Isambard, after syncing the repository and provisioning the W&B secret:
 
 ```bash
 cd "$SCRATCH/torchspec/torchspec"
-# Build the large SIF on an allocated compute node, not the login node.
-sbatch ./examples/qwen35-9b-isambard/prepare.sbatch
-# Wait for the preparation job to complete successfully, then submit training.
+# The training job builds the SIF first when it is absent, avoiding a second
+# queue wait. For image-only preparation, use prepare.sbatch instead.
 sbatch ./examples/qwen35-9b-isambard/submit.sbatch
 ```
 
@@ -59,3 +58,6 @@ assembly was therefore moved to `prepare.sbatch` so it runs on an allocated
 compute node. Isambard schedules the supported jobs as full four-GPU node
 allocations. The training wrapper explicitly exposes only GPUs `0,1` inside the
 container, retaining the original run's one-inference/one-training topology.
+The training submission also performs preparation when the SIF is absent. This
+avoids completing an image-prep allocation only to return to the queue for a
+second full-node allocation.

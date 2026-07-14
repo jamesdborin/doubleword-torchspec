@@ -16,4 +16,7 @@ SRC="${SRC:-$SCRATCH/torchspec/torchspec}"
 WORK="${WORK:-$SCRATCH/torchspec-qwen35-9b}"
 
 cd "$SRC"
+if [[ ! -s "$WORK/images/torchspec-latest.sif" ]]; then
+    ./examples/qwen35-9b-isambard/prepare_isambard.sh
+fi
 exec ./examples/qwen35-9b-isambard/run_apptainer.sh
