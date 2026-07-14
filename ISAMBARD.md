@@ -61,3 +61,7 @@ container, retaining the original run's one-inference/one-training topology.
 The training submission also performs preparation when the SIF is absent. This
 avoids completing an image-prep allocation only to return to the queue for a
 second full-node allocation.
+
+- Slurm rejected the initial 72-hour training request with
+  `QOSMaxWallDurationPerJobLimit`. `sbatch --test-only` confirmed that 24 hours
+  is accepted for this account, so the committed training wall time is 24h.
