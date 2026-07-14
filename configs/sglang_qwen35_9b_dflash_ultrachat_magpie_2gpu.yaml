@@ -24,6 +24,7 @@ model:
   trust_remote_code: true
   draft_model_config: torchspec/config/dflash_draft_config_qwen35_9b_ultrachat_magpie.json
   target_model_backend: sglang
+  embedding_key: model.language_model.embed_tokens.weight
   lm_head_key: lm_head.weight
   norm_key: model.language_model.norm.weight
 

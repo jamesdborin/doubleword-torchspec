@@ -83,3 +83,8 @@ second full-node allocation.
   loaded all 500,000 rows. It then OOM-killed during tokenization because the
   previous hard-coded default spawned 64 tokenizer processes. Dataset worker
   count is now a structured config field, and Isambard caps it at 8.
+- Job `5654028` successfully wrote the 500,000-row tokenized dataset cache
+  (21 GB) and downloaded Qwen3.5-9B, then failed trainer initialization because
+  the recipe inherited the generic `model.embed_tokens.weight` key. The source
+  W&B run used Qwen3.5's `model.language_model.embed_tokens.weight`; that key is
+  now explicit in the model recipe.
