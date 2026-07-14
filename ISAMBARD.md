@@ -124,3 +124,12 @@ second full-node allocation.
   16 GiB Mooncake segment when doubled. The launcher now sizes the inference
   pool and threshold to exactly one global batch. It also enables expandable
   CUDA allocator segments to reduce fragmentation.
+- Launched the unrestricted three-epoch run as Slurm job `5655199` on
+  `nid010318`: three FSDP2 `FULL_SHARD` training GPUs, one SGLang inference GPU,
+  micro-batch 22, accumulation 1, and global batch 66. The resulting schedule
+  is 22,725 optimizer steps (7,575 per epoch).
+- The full run passed the batch-boundary check and continued beyond step 3.
+  W&B run `m58w9g79` is live at
+  <https://wandb.ai/doubleword/qwen35-9b-dflash/runs/m58w9g79>. API verification
+  reported state `running`, `train/step=3`, `train/avg_loss=12.875295639038086`,
+  and `perf/train_capacity=9.16365372635988`.
