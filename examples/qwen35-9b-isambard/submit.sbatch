@@ -4,7 +4,7 @@
 #SBATCH --partition=workq
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus=2
+#SBATCH --gpus=4
 #SBATCH --cpus-per-task=64
 #SBATCH --time=72:00:00
 #SBATCH --output=/scratch/s6p/%u/torchspec-qwen35-9b/logs/slurm-%j.out

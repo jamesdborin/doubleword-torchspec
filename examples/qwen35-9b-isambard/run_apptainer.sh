@@ -27,6 +27,9 @@ export TORCHINDUCTOR_CACHE_DIR="$WORK/torchinductor"
 export TORCHSPEC_LOG_DIR="$WORK/logs"
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
 export MC_STORE_MEMCPY="${MC_STORE_MEMCPY:-0}"
+# Isambard schedules whole four-GPU nodes. Preserve the source run's two-GPU
+# topology by exposing exactly one inference GPU and one training GPU.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 # Ray Unix sockets have a 107-byte path limit, so keep these paths node-local and short.
 export TMPDIR="/tmp/ts-${SLURM_JOB_ID:-manual}"
@@ -46,6 +49,7 @@ export APPTAINERENV_TORCHSPEC_LOG_LEVEL="$TORCHSPEC_LOG_LEVEL"
 export APPTAINERENV_TMPDIR="$TMPDIR"
 export APPTAINERENV_RAY_TMPDIR="$RAY_TMPDIR"
 export APPTAINERENV_WANDB_API_KEY="$WANDB_API_KEY"
+export APPTAINERENV_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
 export APPTAINERENV_PYTHONPATH="/workspace/TorchSpec:$WORK/container-pydeps:${PYTHONPATH:-}"
 export APPTAINERENV_LD_LIBRARY_PATH="$CUDA12_LIB:${LD_LIBRARY_PATH:-}"
 
