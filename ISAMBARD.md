@@ -70,3 +70,6 @@ second full-node allocation.
 - Liger preparation checks the image and persistent dependency layer first. If
   installation is required it uses `--no-deps`, avoiding a duplicate PyTorch
   and CUDA stack under scratch.
+- Found the active account reservation `brics_s6p` (four nodes, through
+  2026-08-01). The initial jobs omitted the reservation and consequently sat in
+  the general priority queue. Both Slurm scripts now request it explicitly.

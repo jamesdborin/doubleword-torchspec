@@ -2,6 +2,7 @@
 #SBATCH --job-name=qwen35-9b-dflash
 #SBATCH --account=brics.s6p
 #SBATCH --partition=workq
+#SBATCH --reservation=brics_s6p
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=4
