@@ -6,11 +6,19 @@ SRC="${SRC:-$SCRATCH/torchspec/torchspec}"
 WORK="${WORK:-$SCRATCH/torchspec-qwen35-9b}"
 IMAGE="${IMAGE:-$WORK/images/torchspec-latest.sif}"
 WANDB_ENV_FILE="${WANDB_ENV_FILE:-$WORK/secrets/wandb.env}"
+SGLANG_QWEN3_VL="/sgl-workspace/sglang/python/sglang/srt/models/qwen3_vl.py"
+PATCH_FILE="$SRC/examples/qwen35-9b-isambard/patches/qwen3_vl-qwen35-aux-capture.patch"
+PATCHED_QWEN3_VL="$WORK/sglang-patches/qwen3_vl.py"
 
 [[ -s "$IMAGE" ]] || { echo "Missing image: $IMAGE" >&2; exit 1; }
 [[ -s "$WANDB_ENV_FILE" ]] || { echo "Missing W&B environment file: $WANDB_ENV_FILE" >&2; exit 1; }
 
-mkdir -p "$WORK"/{apptainer-cache,apptainer-tmp,cache,checkpoints,container-pydeps,hf-cache,logs,outputs,tmp,torchinductor}
+mkdir -p "$WORK"/{apptainer-cache,apptainer-tmp,cache,checkpoints,container-pydeps,hf-cache,logs,outputs,sglang-patches,tmp,torchinductor}
+
+# Keep the SIF immutable. Materialize and patch the affected SGLang source on
+# scratch, then bind just that file over the container copy.
+apptainer exec "$IMAGE" cat "$SGLANG_QWEN3_VL" > "$PATCHED_QWEN3_VL"
+patch --silent "$PATCHED_QWEN3_VL" < "$PATCH_FILE"
 
 set -a
 # shellcheck disable=SC1090
@@ -57,6 +65,7 @@ apptainer exec --nv \
     --bind "$SRC:/workspace/TorchSpec" \
     --bind "$WORK:$WORK" \
     --bind "$CUDA12_LIB:$CUDA12_LIB" \
+    --bind "$PATCHED_QWEN3_VL:$SGLANG_QWEN3_VL" \
     "$IMAGE" \
     bash -lc '
         set -euo pipefail

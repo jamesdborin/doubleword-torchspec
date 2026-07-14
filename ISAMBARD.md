@@ -88,3 +88,9 @@ second full-node allocation.
   the recipe inherited the generic `model.embed_tokens.weight` key. The source
   W&B run used Qwen3.5's `model.language_model.embed_tokens.weight`; that key is
   now explicit in the model recipe.
+- Job `5654541` initialized the trainer and SGLang model and entered the
+  training loop, but SGLang's Qwen3.5 wrapper crashed on the first inference
+  batch. Its generic auxiliary-state setup wrote a `layers_to_capture` field
+  that Qwen3.5 does not consume, so no aux states were returned. The launcher
+  now binds a narrow patch over `qwen3_vl.py` that delegates supplied layer IDs
+  to Qwen3.5's per-layer capture setter while leaving the cached SIF immutable.

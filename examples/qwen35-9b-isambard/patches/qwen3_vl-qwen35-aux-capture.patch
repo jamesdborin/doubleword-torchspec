@@ -1,0 +1,17 @@
+--- qwen3_vl.py
++++ qwen3_vl.py
+@@ -1392,7 +1392,12 @@
+                 num_layers - 3,
+             ]  # Specific layers for EAGLE3 support
+         else:
+-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
++            shifted_layer_ids = [val + 1 for val in layer_ids]
++            # Qwen3.5's inner causal-LM wrapper captures through per-layer
++            # flags, not a layers_to_capture attribute on the wrapper.
++            if hasattr(self.model, "set_dflash_layers_to_capture"):
++                self.model.set_dflash_layers_to_capture(shifted_layer_ids)
++            else:
++                self.model.layers_to_capture = shifted_layer_ids
+
+     def get_embed_and_head(self):
+         return self.model.embed_tokens.weight, self.lm_head.weight
