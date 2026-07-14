@@ -38,7 +38,9 @@ On Isambard, after syncing the repository and provisioning the W&B secret:
 
 ```bash
 cd "$SCRATCH/torchspec/torchspec"
-./examples/qwen35-9b-isambard/prepare_isambard.sh
+# Build the large SIF on an allocated compute node, not the login node.
+sbatch ./examples/qwen35-9b-isambard/prepare.sbatch
+# Wait for the preparation job to complete successfully, then submit training.
 sbatch ./examples/qwen35-9b-isambard/submit.sbatch
 ```
 
@@ -49,3 +51,9 @@ squeue -u "$USER"
 sacct -j JOB_ID --format=JobID,JobName,State,ExitCode,Elapsed,AllocTRES%60
 tail -f "$SCRATCH/torchspec-qwen35-9b/logs/slurm-JOB_ID.out"
 ```
+
+The first interactive image build attempt downloaded all OCI layers but the
+login-node process disappeared during extraction before producing the SIF. The
+downloaded layers remained reusable in the scratch Apptainer cache. Image
+assembly was therefore moved to `prepare.sbatch` so it runs on an allocated
+compute node.
