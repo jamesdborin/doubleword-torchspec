@@ -45,6 +45,9 @@ FSDP_STRATEGY="${FSDP_STRATEGY:-FULL_SHARD}"
 NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-}"
 RUN_SUFFIX="${RUN_SUFFIX:-3train-fsdp-mbs${MICRO_BATCH_SIZE}}"
 TRAIN_STEP_ARG="${NUM_TRAIN_STEPS:+training.num_train_steps=$NUM_TRAIN_STEPS}"
+GLOBAL_BATCH_SIZE=$((TRAIN_GPUS * MICRO_BATCH_SIZE))
+SAMPLE_POOL_SIZE="${SAMPLE_POOL_SIZE:-$((GLOBAL_BATCH_SIZE * 2))}"
+INFERENCE_BUFFER_THRESHOLD="${INFERENCE_BUFFER_THRESHOLD:-$GLOBAL_BATCH_SIZE}"
 
 # Ray Unix sockets have a 107-byte path limit, so keep these paths node-local and short.
 export TMPDIR="/tmp/ts-${SLURM_JOB_ID:-manual}"
@@ -86,8 +89,8 @@ apptainer exec --nv \
           training.dflash_num_anchors=256 \
           training.use_liger_kernel=true \
           dataset.num_proc=8 \
-          inference.max_sample_pool_size=32 \
-          inference.inference_buffer_threshold=16 \
+          inference.max_sample_pool_size='"$SAMPLE_POOL_SIZE"' \
+          inference.inference_buffer_threshold='"$INFERENCE_BUFFER_THRESHOLD"' \
           output_dir='"$WORK"'/outputs/qwen35-9b-dflash-ultrachat-liger-a256-'"$RUN_SUFFIX"' \
           cache_dir='"$WORK"'/cache/qwen35-9b-dflash-ultrachat-liger-a256-b16 \
           model_download_dir='"$WORK"'/hf-cache \
