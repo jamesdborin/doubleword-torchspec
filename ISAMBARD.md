@@ -73,3 +73,8 @@ second full-node allocation.
 - Found the active account reservation `brics_s6p` (four nodes, through
   2026-08-01). The initial jobs omitted the reservation and consequently sat in
   the general priority queue. Both Slurm scripts now request it explicitly.
+- Job `5653320` started immediately on reserved node `nid010318`, but the image
+  build failed after about 17 minutes: expanding the ~30 GB OCI rootfs alongside
+  the 13 GB reusable layer cache exceeded scratch quota. Persistent blobs and
+  the final SIF remain on scratch; Slurm builds now use short-lived node-local
+  `/tmp/apptainer-$SLURM_JOB_ID` for extraction.

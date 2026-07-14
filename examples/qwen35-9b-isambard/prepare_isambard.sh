@@ -5,10 +5,12 @@ set -euo pipefail
 WORK="${WORK:-$SCRATCH/torchspec-qwen35-9b}"
 IMAGE_URI="${IMAGE_URI:-docker://ghcr.io/doublewordai/torchspec:latest}"
 IMAGE="${IMAGE:-$WORK/images/torchspec-latest.sif}"
+BUILD_TMP="${BUILD_TMP:-${SLURM_JOB_ID:+/tmp/apptainer-$SLURM_JOB_ID}}"
+BUILD_TMP="${BUILD_TMP:-$WORK/apptainer-tmp}"
 
-mkdir -p "$WORK"/{apptainer-cache,apptainer-tmp,cache,checkpoints,container-pydeps,hf-cache,images,logs,outputs,tmp,torchinductor}
+mkdir -p "$WORK"/{apptainer-cache,cache,checkpoints,container-pydeps,hf-cache,images,logs,outputs,tmp,torchinductor} "$BUILD_TMP"
 export APPTAINER_CACHEDIR="$WORK/apptainer-cache"
-export APPTAINER_TMPDIR="$WORK/apptainer-tmp"
+export APPTAINER_TMPDIR="$BUILD_TMP"
 
 if [[ ! -s "$IMAGE" ]]; then
     apptainer build "$IMAGE" "$IMAGE_URI"
