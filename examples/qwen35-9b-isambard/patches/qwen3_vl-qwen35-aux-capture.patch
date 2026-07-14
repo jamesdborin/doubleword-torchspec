@@ -1,6 +1,6 @@
 --- qwen3_vl.py
 +++ qwen3_vl.py
-@@ -1392,7 +1392,12 @@
+@@ -1392,7 +1392,13 @@
                  num_layers - 3,
              ]  # Specific layers for EAGLE3 support
          else:

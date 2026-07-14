@@ -94,3 +94,5 @@ second full-node allocation.
   that Qwen3.5 does not consume, so no aux states were returned. The launcher
   now binds a narrow patch over `qwen3_vl.py` that delegates supplied layer IDs
   to Qwen3.5's per-layer capture setter while leaving the cached SIF immutable.
+- Corrected the patch hunk length after the first dry-run validation caught a
+  malformed unified-diff header; no training job was submitted with that draft.
