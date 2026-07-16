@@ -8,7 +8,7 @@ IMAGE="${IMAGE:-$WORK/images/torchspec-latest.sif}"
 WANDB_ENV_FILE="${WANDB_ENV_FILE:-$WORK/secrets/wandb.env}"
 SGLANG_QWEN3_VL="/sgl-workspace/sglang/python/sglang/srt/models/qwen3_vl.py"
 PATCH_FILE="$SRC/examples/qwen35-9b-isambard/patches/qwen3_vl-qwen35-aux-capture.patch"
-PATCHED_QWEN3_VL="$WORK/sglang-patches/qwen3_vl.py"
+PATCHED_QWEN3_VL="$WORK/sglang-patches/qwen3_vl-${SLURM_JOB_ID:-manual}.py"
 
 [[ -s "$IMAGE" ]] || { echo "Missing image: $IMAGE" >&2; exit 1; }
 [[ -s "$WANDB_ENV_FILE" ]] || { echo "Missing W&B environment file: $WANDB_ENV_FILE" >&2; exit 1; }
@@ -45,7 +45,13 @@ MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-22}"
 FSDP_STRATEGY="${FSDP_STRATEGY:-FULL_SHARD}"
 NUM_TRAIN_STEPS="${NUM_TRAIN_STEPS:-}"
 RUN_SUFFIX="${RUN_SUFFIX:-3train-fsdp-mbs${MICRO_BATCH_SIZE}}"
+LOAD_PATH="${LOAD_PATH:-}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-}"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-}"
 TRAIN_STEP_ARG="${NUM_TRAIN_STEPS:+training.num_train_steps=$NUM_TRAIN_STEPS}"
+LOAD_PATH_ARG="${LOAD_PATH:+training.load_path=$LOAD_PATH}"
+WANDB_RUN_ID_ARG="${WANDB_RUN_ID:+logging.wandb_run_id=$WANDB_RUN_ID}"
+TRAIN_DATA_PATH_ARG="${TRAIN_DATA_PATH:+dataset.train_data_path=$TRAIN_DATA_PATH}"
 GLOBAL_BATCH_SIZE=$((TRAIN_GPUS * MICRO_BATCH_SIZE))
 SAMPLE_POOL_SIZE="${SAMPLE_POOL_SIZE:-$GLOBAL_BATCH_SIZE}"
 INFERENCE_BUFFER_THRESHOLD="${INFERENCE_BUFFER_THRESHOLD:-$GLOBAL_BATCH_SIZE}"
@@ -96,5 +102,8 @@ apptainer exec --nv \
           output_dir='"$WORK"'/outputs/qwen35-9b-dflash-ultrachat-liger-a256-'"$RUN_SUFFIX"' \
           cache_dir='"$WORK"'/cache/qwen35-9b-dflash-ultrachat-liger-a256-b16 \
           model_download_dir='"$WORK"'/hf-cache \
-          '"$TRAIN_STEP_ARG"'
+          '"$TRAIN_STEP_ARG"' \
+          '"$LOAD_PATH_ARG"' \
+          '"$WANDB_RUN_ID_ARG"' \
+          '"$TRAIN_DATA_PATH_ARG"'
     '
