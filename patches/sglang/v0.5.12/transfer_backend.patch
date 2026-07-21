@@ -1,0 +1,320 @@
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index 652757c..b4a345a 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -395,6 +395,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             spec_training_data_ids=recv_obj.spec_training_data_ids,
+             packed_loss_masks=recv_obj.packed_loss_masks,
+             spec_training_mooncake_store_keys=recv_obj.spec_training_mooncake_store_keys,
++            spec_training_transfer_refs=recv_obj.spec_training_transfer_refs,
+         )
+
+     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 282803a..92920bc 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1179,6 +1179,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     spec_training_data_ids: Optional[List[str]] = None
+     packed_loss_masks: Optional[List[str]] = None
+     spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
++    spec_training_transfer_refs: Optional[List[List[dict]]] = None
+
+     # For observability
+     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+@@ -1250,6 +1251,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+     spec_training_data_ids: Optional[List[str]] = None
+     packed_loss_masks: Optional[List[str]] = None
+     spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
++    spec_training_transfer_refs: Optional[List[List[dict]]] = None
+
+     # For observability
+     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 0c50370..e7c0af6 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -669,6 +669,7 @@ class Req(ReqDllmMixin):
+         self.spec_training_data_id = spec_training_data_id
+         self.packed_loss_mask = packed_loss_mask
+         self.spec_training_mooncake_store_keys: List[str] = []
++        self.spec_training_transfer_refs: List[dict] = []
+
+         # Require reasoning for the request
+         self.require_reasoning = require_reasoning
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 9b87997..b89f047 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -433,10 +433,13 @@ class Scheduler(
+         # Init mamba backend
+         self.init_mamba_backend()
+
+-        # Start mooncake store init in background (overlaps with model loading)
++        # Start the TorchSpec transfer backend in the background (overlaps with
++        # model loading).  The command-line flag retains its historical name so
++        # existing TorchSpec launchers remain compatible.
+         self._mooncake_init_thread = None
+         self._mooncake_init_error = None
+         self.eagle_mooncake_store = None
++        self.spec_training_transfer_backend = None
+         if self.server_args.enable_spec_training_mooncake and self.attn_tp_rank == 0:
+             import threading
+
+@@ -444,7 +447,7 @@ class Scheduler(
+
+             def _init_mooncake():
+                 try:
+-                    self.init_eagle_mooncake_store(device=mooncake_device)
++                    self.init_spec_training_transfer_backend(device=mooncake_device)
+                 except Exception as e:
+                     self._mooncake_init_error = e
+
+@@ -1090,25 +1093,39 @@ class Scheduler(
+         self.forward_sleep_time = None
+         self._engine_paused = False
+
+-    def init_eagle_mooncake_store(self, device=None):
++    def init_spec_training_transfer_backend(self, device=None):
+         if self.server_args.enable_spec_training_mooncake:
+             try:
+-                from torchspec.transfer.mooncake import (
+-                    EagleMooncakeStore,
+-                    MooncakeConfig,
++                from torchspec.transfer import (
++                    TransferRole,
++                    create_transfer_backend_from_env,
+                 )
+
+-                config = MooncakeConfig.from_env()
+-                store = EagleMooncakeStore(config)
+-                store.setup(device=device or self.device)
+-                store.warmup_rdma()
+-                self.eagle_mooncake_store = store
+-                logger.info("EagleMooncakeStore initialized for spec training")
++                backend = create_transfer_backend_from_env(
++                    device=device or self.device,
++                    role=TransferRole.PRODUCER,
++                )
++                self.spec_training_transfer_backend = backend
++                # Preserve the legacy attribute for integrations which inspect
++                # SGLang's scheduler directly.  Generic code uses the backend.
++                self.eagle_mooncake_store = getattr(backend, "store", None)
++                if self.eagle_mooncake_store is not None and hasattr(
++                    self.eagle_mooncake_store, "warmup_rdma"
++                ):
++                    self.eagle_mooncake_store.warmup_rdma()
++                logger.info(
++                    "TorchSpec transfer backend initialized for spec training: %s",
++                    type(backend).__name__,
++                )
+             except ImportError:
+                 logger.warning(
+-                    "torchspec.mooncake not found. Spec training mooncake store disabled."
++                    "torchspec transfer support not found. Spec training transfer disabled."
+                 )
+
++    def init_eagle_mooncake_store(self, device=None):
++        """Compatibility alias for older integrations and tests."""
++        return self.init_spec_training_transfer_backend(device=device)
++
+     def init_chunked_prefill(self):
+         self.chunked_prefill_size = self.server_args.chunked_prefill_size
+         uses_transformers_backend = (
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index 2c12870..833e9f4 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -1011,7 +1011,10 @@ class SchedulerOutputProcessorMixin:
+         if (
+             batch.spec_training_info is not None
+             and batch.spec_training_info.has_request(req.rid)
+-            and self.eagle_mooncake_store is not None
++            and (
++                getattr(self, "spec_training_transfer_backend", None) is not None
++                or self.eagle_mooncake_store is not None
++            )
+         ):
+             self._send_hidden_states_to_mooncake(
+                 req, batch, req_hidden_states, logits_output, hidden_state_offset,
+@@ -1024,7 +1027,7 @@ class SchedulerOutputProcessorMixin:
+                 req_hidden_states.cpu().clone().tolist()
+             )
+
+-    def _put_spec_training_mooncake(
++    def _put_spec_training_transfer(
+         self: Scheduler,
+         key: str,
+         hidden_states: torch.Tensor,
+@@ -1033,7 +1036,11 @@ class SchedulerOutputProcessorMixin:
+     ):
+         import os
+
+-        if os.getenv("TORCHSPEC_USP_SHARDED_MOONCAKE") == "1":
++        backend_name = os.getenv("TORCHSPEC_TRANSFER_BACKEND", "mooncake").lower()
++        if (
++            backend_name == "mooncake"
++            and os.getenv("TORCHSPEC_USP_SHARDED_MOONCAKE") == "1"
++        ):
+             max_seq_raw = os.environ.get("TORCHSPEC_USP_MAX_SEQ_LENGTH")
+             self.eagle_mooncake_store.put_usp_shards(
+                 key=key,
+@@ -1046,14 +1053,65 @@ class SchedulerOutputProcessorMixin:
+                 ttt_length=int(os.environ.get("TORCHSPEC_USP_TTT_LENGTH", "1")),
+                 max_seq_length=int(max_seq_raw) if max_seq_raw else None,
+             )
+-            return
++            from torchspec.transfer import TensorSpec, TransferRef
+
++            tensors = {
++                "hidden_states": hidden_states,
++                "input_ids": input_ids,
++            }
++            if last_hidden_states is not None:
++                tensors["last_hidden_states"] = last_hidden_states
++            return TransferRef(
++                backend="mooncake",
++                object_id=key,
++                tensors={
++                    name: TensorSpec(tuple(tensor.shape), str(tensor.dtype))
++                    for name, tensor in tensors.items()
++                },
++                locator={"key": key},
++                metadata={"usp_sharded": True},
++            )
++
++        tensors = {
++            "hidden_states": hidden_states,
++            "input_ids": input_ids,
++        }
++        if last_hidden_states is not None:
++            tensors["last_hidden_states"] = last_hidden_states
++        backend = getattr(self, "spec_training_transfer_backend", None)
++        if backend is not None:
++            return backend.put(object_id=key, tensors=tensors)
++
++        # Compatibility for tests and embedders that inject the legacy store.
+         self.eagle_mooncake_store.put(
+             key=key,
+             hidden_states=hidden_states,
+             input_ids=input_ids,
+             last_hidden_states=last_hidden_states,
+         )
++        from torchspec.transfer import TensorSpec, TransferRef
++
++        return TransferRef(
++            backend="mooncake",
++            object_id=key,
++            tensors={
++                name: TensorSpec(tuple(tensor.shape), str(tensor.dtype))
++                for name, tensor in tensors.items()
++            },
++            locator={"key": key},
++        )
++
++    def _put_spec_training_mooncake(
++        self: Scheduler,
++        key: str,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        last_hidden_states: Optional[torch.Tensor],
++    ):
++        """Compatibility alias for the backend-neutral transfer path."""
++        return self._put_spec_training_transfer(
++            key, hidden_states, input_ids, last_hidden_states
++        )
+
+     def _send_hidden_states_to_mooncake(
+         self: Scheduler,
+@@ -1084,15 +1142,17 @@ class SchedulerOutputProcessorMixin:
+         if hidden_states.is_cuda and copy_done_event is not None:
+             torch.cuda.current_stream().wait_event(copy_done_event)
+
+-        self._put_spec_training_mooncake(
++        transfer_ref = self._put_spec_training_transfer(
+             key=key,
+             hidden_states=hidden_states,
+             input_ids=input_ids,
+             last_hidden_states=last_hidden_states,
+         )
+
+-        req.spec_training_mooncake_store_keys.append(key)
+-        batch.spec_training_info.mooncake_store_keys[data_id].append(key)
++        req.spec_training_transfer_refs.append(transfer_ref.to_dict())
++        if transfer_ref.backend == "mooncake":
++            req.spec_training_mooncake_store_keys.append(key)
++            batch.spec_training_info.mooncake_store_keys[data_id].append(key)
+
+     def stream_output(
+         self: Scheduler,
+@@ -1156,17 +1216,22 @@ class SchedulerOutputProcessorMixin:
+         indexer_topk = None
+         customized_info = {}
+
+-        if self.attn_tp_rank == 0 and self.eagle_mooncake_store is not None:
++        transfer_backend = getattr(self, "spec_training_transfer_backend", None)
++        if self.attn_tp_rank == 0 and transfer_backend is not None:
++            transfer_backend.flush()
++        elif self.attn_tp_rank == 0 and self.eagle_mooncake_store is not None:
+             self.eagle_mooncake_store.flush()
+
+         if self.attn_tp_rank == 0:
+             spec_training_data_ids = []
+             packed_loss_masks = []
+             spec_training_mooncake_store_keys = []
++            spec_training_transfer_refs = []
+         else:
+             spec_training_data_ids = None
+             packed_loss_masks = None
+             spec_training_mooncake_store_keys = None
++            spec_training_transfer_refs = None
+
+         time_stats = []
+
+@@ -1280,6 +1345,7 @@ class SchedulerOutputProcessorMixin:
+                     spec_training_mooncake_store_keys.append(
+                         req.spec_training_mooncake_store_keys
+                     )
++                    spec_training_transfer_refs.append(req.spec_training_transfer_refs)
+
+                 if return_logprob:
+                     if (
+@@ -1354,7 +1420,10 @@ class SchedulerOutputProcessorMixin:
+                     uses_mooncake = (
+                         self.attn_tp_rank == 0
+                         and req.spec_training_data_id is not None
+-                        and self.eagle_mooncake_store is not None
++                        and (
++                            transfer_backend is not None
++                            or self.eagle_mooncake_store is not None
++                        )
+                     )
+                     if not uses_mooncake:
+                         if output_hidden_states is None:
+@@ -1440,6 +1509,11 @@ class SchedulerOutputProcessorMixin:
+                         if spec_training_mooncake_store_keys
+                         else None
+                     ),
++                    spec_training_transfer_refs=(
++                        spec_training_transfer_refs
++                        if spec_training_transfer_refs
++                        else None
++                    ),
+                 )
+             )
+
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 8bc57be..73cf921 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1756,6 +1756,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 meta_info["spec_training_mooncake_store_keys"] = (
+                     recv_obj.spec_training_mooncake_store_keys[i]
+                 )
++                if getattr(recv_obj, "spec_training_transfer_refs", None) is not None:
++                    meta_info["spec_training_transfer_refs"] = (
++                        recv_obj.spec_training_transfer_refs[i]
++                    )
+
+             state.finished = recv_obj.finished_reasons[i] is not None
+             if isinstance(recv_obj, BatchStrOutput):

@@ -28,7 +28,7 @@ Data flow:
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -37,26 +37,66 @@ from ray.util.queue import Queue as RayQueue
 from torch.utils.data import DataLoader, IterableDataset
 
 from torchspec.data.utils import deserialize_packed_loss_mask, resolve_loss_mask, unpack_loss_mask
+from torchspec.transfer.base import (
+    TensorSpec,
+    TransferBackend,
+    TransferProtocolError,
+    TransferRef,
+    TransferRole,
+)
+from torchspec.transfer.mooncake.backend import MooncakeTransferBackend
 from torchspec.utils.distributed import (
     get_draft_sp_group,
     get_sp_ring_group,
     get_usp_rank_coords,
 )
 from torchspec.utils.logging import logger
+from torchspec.utils.types import legacy_mooncake_transfer_ref, normalize_transfer_ref
 
 
 @dataclass
 class TrainSample:
-    mooncake_key: str
-    tensor_shapes: Dict[str, Tuple[int, ...]]
-    tensor_dtypes: Optional[Dict[str, torch.dtype]] = None
+    mooncake_key: str | None = None
+    tensor_shapes: Dict[str, Tuple[int, ...]] | None = None
+    tensor_dtypes: Optional[Dict[str, torch.dtype | str]] = None
     packed_loss_mask: Optional[str] = None
     last_turn_loss_only: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
+    transfer_ref: TransferRef | Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self.transfer_ref = normalize_transfer_ref(self.transfer_ref)
+        if self.transfer_ref is None:
+            if not self.mooncake_key:
+                raise ValueError("training sample requires transfer_ref or mooncake_key")
+            self.transfer_ref = legacy_mooncake_transfer_ref(
+                self.mooncake_key,
+                self.tensor_shapes,
+                self.tensor_dtypes,
+                metadata=self.metadata,
+            )
+        if self.mooncake_key is None:
+            self.mooncake_key = str(
+                self.transfer_ref.locator.get("key", self.transfer_ref.object_id)
+            )
+        if self.tensor_shapes is None:
+            self.tensor_shapes = {
+                name: spec.shape for name, spec in self.transfer_ref.tensors.items()
+            }
+        if self.tensor_dtypes is None:
+            self.tensor_dtypes = {
+                name: getattr(torch, spec.dtype) for name, spec in self.transfer_ref.tensors.items()
+            }
 
 
-class MooncakeDataset(IterableDataset):
-    """IterableDataset that loads from mooncake via queue.
+def _as_consumer_backend(value: Any, device: torch.device) -> TransferBackend:
+    backend = value if isinstance(value, TransferBackend) else MooncakeTransferBackend(value)
+    backend.setup(TransferRole.CONSUMER, device)
+    return backend
+
+
+class TransferDataset(IterableDataset):
+    """IterableDataset that loads backend-neutral tensor references via queue.
 
     Each DP rank waits on its queue for TrainSample items sent by the
     centralized controller. Data is loaded from mooncake.
@@ -65,8 +105,8 @@ class MooncakeDataset(IterableDataset):
     def __init__(
         self,
         ray_queue: RayQueue,
-        mooncake_store,
-        device: torch.device,
+        transfer_backend=None,
+        device: torch.device | None = None,
         prefetch_factor: int = 2,
         timeout: Optional[float] = None,
         assistant_header_ids: Optional[List[int]] = None,
@@ -79,9 +119,20 @@ class MooncakeDataset(IterableDataset):
         usp_enabled: bool = False,
         ttt_length: int = 1,
         max_seq_length: Optional[int] = None,
+        *,
+        mooncake_store=None,
     ):
+        if transfer_backend is not None and mooncake_store is not None:
+            raise ValueError("provide transfer_backend or mooncake_store, not both")
+        transfer_backend = transfer_backend if transfer_backend is not None else mooncake_store
+        if transfer_backend is None:
+            raise ValueError("a transfer backend is required")
+        if device is None:
+            raise ValueError("device is required")
         self.ray_queue = ray_queue
-        self.mooncake_store = mooncake_store
+        self.transfer_backend = _as_consumer_backend(transfer_backend, device)
+        # Retained for callers/tests that introspect the legacy attribute.
+        self.mooncake_store = getattr(self.transfer_backend, "store", transfer_backend)
         self.device = device
         self.prefetch_factor = prefetch_factor
         self.timeout = timeout
@@ -119,34 +170,14 @@ class MooncakeDataset(IterableDataset):
             self._sp_ring_size = dist.get_world_size(ring_group)
             self._sp_ring_rank = dist.get_rank(ring_group)
 
-    def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
-        """Load tensors from mooncake key into device memory."""
-        dtypes_raw = sample.tensor_dtypes or {}
-
-        # Convert string dtypes to torch.dtype objects
-        dtypes = {}
-        for key, dtype_val in dtypes_raw.items():
-            if isinstance(dtype_val, str):
-                # Handle "bfloat16" or "torch.bfloat16" format
-                dtype_str = dtype_val.replace("torch.", "")
-                dtypes[key] = getattr(torch, dtype_str)
-            else:
-                dtypes[key] = dtype_val
-
-        # DEBUG: Print the shapes we're requesting
+    def _load_from_transfer(self, sample: TrainSample) -> Dict[str, Any]:
+        """Load tensors through the selected transfer backend."""
         logger.debug(
-            f"_load_from_mooncake: key={sample.mooncake_key}, "
+            f"_load_from_transfer: key={sample.mooncake_key}, "
             f"requesting shapes={sample.tensor_shapes}"
         )
-
-        tensors = self.mooncake_store.get(
-            key=sample.mooncake_key,
-            shapes=sample.tensor_shapes,
-            dtypes=dtypes,
-            device=self.device,
-        )
-
-        tensor_dict = tensors.to_tensor_dict()
+        assert isinstance(sample.transfer_ref, TransferRef)
+        tensor_dict = dict(self.transfer_backend.get(sample.transfer_ref, self.device))
         if self._batch_size > 1:
             # Clone to prevent use-after-free: collator holds sample N while
             # fetching N+1, but cleanup frees the Mooncake buffer (Issue 31).
@@ -158,24 +189,19 @@ class MooncakeDataset(IterableDataset):
             # Preserves pinned memory for async H2D via non_blocking=True.
             result = dict(tensor_dict)
 
-        self._cleanup_mooncake_data(sample)
+        self.transfer_backend.release(sample.transfer_ref)
         if sample.packed_loss_mask is not None:
             result["packed_loss_mask"] = sample.packed_loss_mask
         if sample.last_turn_loss_only is not None:
             result["last_turn_loss_only"] = sample.last_turn_loss_only
         return result
 
+    _load_from_mooncake = _load_from_transfer
+
     def _cleanup_mooncake_data(self, sample: TrainSample) -> None:
         """Remove data from mooncake store to release buffer space."""
-        shapes = sample.tensor_shapes or {}
-        has_lhs = "last_hidden_states" in shapes
-        has_target = "target" in shapes
-
-        self.mooncake_store.remove_eagle3_tensors(
-            sample.mooncake_key,
-            has_last_hidden_states=has_lhs,
-            has_target=has_target,
-        )
+        assert isinstance(sample.transfer_ref, TransferRef)
+        self.transfer_backend.release(sample.transfer_ref)
 
     def _compute_loss_mask(self, data: Dict[str, Any]) -> torch.Tensor | None:
         return resolve_loss_mask(
@@ -244,7 +270,7 @@ class MooncakeDataset(IterableDataset):
                 break
 
             logger.debug(f"__iter__: got item, mooncake_key={item.mooncake_key}")
-            data = self._load_from_mooncake(item)
+            data = self._load_from_transfer(item)
 
             should_skip, skip_count = self._should_skip_for_loss_mask(
                 data, item.mooncake_key, skip_count
@@ -380,29 +406,34 @@ class MooncakeDataset(IterableDataset):
                 )
 
             shapes = self._local_usp_shapes(item)
-            dtypes_raw = item.tensor_dtypes or {}
-            dtypes = {}
-            for key, dtype_val in dtypes_raw.items():
-                if isinstance(dtype_val, str):
-                    dtypes[key] = getattr(torch, dtype_val.replace("torch.", ""))
-                else:
-                    dtypes[key] = dtype_val
-
             should_skip = self._should_skip_usp_sharded_sample(item)
             shard_key = f"{item.mooncake_key}_usp{self._sp_rank}"
-            tensors = self.mooncake_store.get(
-                key=shard_key,
-                shapes=shapes,
-                dtypes=dtypes,
-                device=self.device,
-            ).to_tensor_dict()
+            assert isinstance(item.transfer_ref, TransferRef)
+            if item.transfer_ref.shards:
+                if self._sp_rank >= len(item.transfer_ref.shards):
+                    raise TransferProtocolError(
+                        f"transfer ref has {len(item.transfer_ref.shards)} USP shards, "
+                        f"but rank {self._sp_rank} was requested"
+                    )
+                shard_ref = item.transfer_ref.shards[self._sp_rank]
+            else:
+                dtypes = item.tensor_dtypes or {}
+                shard_ref = TransferRef(
+                    backend=item.transfer_ref.backend,
+                    object_id=shard_key,
+                    tensors={
+                        name: TensorSpec(
+                            shape,
+                            str(dtypes.get(name, torch.bfloat16)).removeprefix("torch."),
+                        )
+                        for name, shape in shapes.items()
+                    },
+                    locator={"key": shard_key},
+                    metadata=item.transfer_ref.metadata,
+                )
+            tensors = dict(self.transfer_backend.get(shard_ref, self.device))
             tensors.update(self._local_usp_loss_and_position(item, shapes["input_ids"][-1]))
-
-            self.mooncake_store.remove_eagle3_tensors(
-                shard_key,
-                has_last_hidden_states="last_hidden_states" in shapes,
-                has_target="target" in shapes,
-            )
+            self.transfer_backend.release(shard_ref)
 
             if should_skip:
                 skipped += 1
@@ -417,11 +448,11 @@ class MooncakeDataset(IterableDataset):
             return tensors, skipped
 
 
-def create_mooncake_dataloader(
+def create_transfer_dataloader(
     ray_queue: RayQueue,
-    mooncake_store,
-    collator: Callable[[List[Dict]], Dict[str, torch.Tensor]],
-    device: torch.device,
+    transfer_backend=None,
+    collator: Callable[[List[Dict]], Dict[str, torch.Tensor]] | None = None,
+    device: torch.device | None = None,
     batch_size: int = 1,
     prefetch_factor: int = 2,
     timeout: Optional[float] = None,
@@ -434,8 +465,10 @@ def create_mooncake_dataloader(
     usp_enabled: bool = False,
     ttt_length: int = 1,
     max_seq_length: Optional[int] = None,
+    *,
+    mooncake_store=None,
 ) -> DataLoader:
-    """Create a DataLoader that fetches from mooncake via queue.
+    """Create a DataLoader that fetches transfer references via queue.
 
     Data flow:
       Controller (dispatches dispatch_batch_size samples) ->
@@ -461,9 +494,15 @@ def create_mooncake_dataloader(
     Returns:
         DataLoader instance.
     """
-    dataset = MooncakeDataset(
+    if transfer_backend is not None and mooncake_store is not None:
+        raise ValueError("provide transfer_backend or mooncake_store, not both")
+    transfer_backend = transfer_backend if transfer_backend is not None else mooncake_store
+    if transfer_backend is None or collator is None or device is None:
+        raise ValueError("transfer backend, collator, and device are required")
+
+    dataset = TransferDataset(
         ray_queue,
-        mooncake_store,
+        transfer_backend,
         device,
         prefetch_factor,
         timeout,
@@ -487,8 +526,8 @@ def create_mooncake_dataloader(
     )
 
 
-class MooncakeDataFetcher:
-    """Queue-based data fetcher for mooncake with DataLoader backend.
+class TransferDataFetcher:
+    """Queue-based data fetcher with a backend-neutral DataLoader backend.
 
     Provides iteration over training samples that are pushed to a Ray queue
     by the AsyncTrainingController and loaded from mooncake.
@@ -506,9 +545,9 @@ class MooncakeDataFetcher:
     def __init__(
         self,
         queue: RayQueue,
-        mooncake_store,
-        collator: Callable[[List[Dict]], Dict[str, torch.Tensor]],
-        device: torch.device,
+        transfer_backend=None,
+        collator: Callable[[List[Dict]], Dict[str, torch.Tensor]] | None = None,
+        device: torch.device | None = None,
         batch_size: int = 1,
         prefetch_factor: int = 2,
         timeout: Optional[float] = None,
@@ -521,11 +560,18 @@ class MooncakeDataFetcher:
         usp_enabled: bool = False,
         ttt_length: int = 1,
         max_seq_length: Optional[int] = None,
+        *,
+        mooncake_store=None,
     ):
+        if transfer_backend is not None and mooncake_store is not None:
+            raise ValueError("provide transfer_backend or mooncake_store, not both")
+        transfer_backend = transfer_backend if transfer_backend is not None else mooncake_store
+        if transfer_backend is None or collator is None or device is None:
+            raise ValueError("transfer backend, collator, and device are required")
         self.batch_size = batch_size
-        self._dataloader = create_mooncake_dataloader(
+        self._dataloader = create_transfer_dataloader(
             ray_queue=queue,
-            mooncake_store=mooncake_store,
+            transfer_backend=transfer_backend,
             collator=collator,
             device=device,
             batch_size=batch_size,
@@ -544,6 +590,11 @@ class MooncakeDataFetcher:
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         return iter(self._dataloader)
+
+
+MooncakeDataset = TransferDataset
+create_mooncake_dataloader = create_transfer_dataloader
+MooncakeDataFetcher = TransferDataFetcher
 
 
 class PrefetchedDataFetcher:

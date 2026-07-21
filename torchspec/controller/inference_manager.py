@@ -47,7 +47,7 @@ import ray
 from ray.exceptions import RayActorError
 
 from torchspec.utils.logging import logger
-from torchspec.utils.types import InferenceInput, InferenceOutput
+from torchspec.utils.types import InferenceInput, InferenceOutput, normalize_transfer_ref
 
 MOONCAKE_BACKPRESSURE_POLL_INTERVAL = 0.5  # seconds
 MOONCAKE_BACKPRESSURE_LOG_INTERVAL = 5.0  # seconds
@@ -476,7 +476,9 @@ class AsyncInferenceManager:
 
     def _parse_engine_output(self, entry: InferenceInput, output: dict) -> InferenceOutput | None:
         """Convert engine output dict to InferenceOutput."""
-        if not isinstance(output, dict) or "mooncake_key" not in output:
+        if not isinstance(output, dict) or not (
+            output.get("transfer_ref") is not None or output.get("mooncake_key")
+        ):
             logger.debug(
                 f"Skipping invalid engine output for data_id={entry.data_id}: {type(output)}"
             )
@@ -487,13 +489,15 @@ class AsyncInferenceManager:
         metadata = dict(entry.metadata or {})
         metadata.update(output.get("metadata", {}) or {})
 
+        transfer_ref = normalize_transfer_ref(output.get("transfer_ref"))
         return InferenceOutput(
             data_id=entry.data_id,
-            mooncake_key=output["mooncake_key"],
-            tensor_shapes=output.get("tensor_shapes", {}),
-            tensor_dtypes=output.get("tensor_dtypes", {}),
+            mooncake_key=output.get("mooncake_key"),
+            tensor_shapes=output.get("tensor_shapes"),
+            tensor_dtypes=output.get("tensor_dtypes"),
             packed_loss_mask=output.get("packed_loss_mask", entry.packed_loss_mask),
             metadata=metadata,
+            transfer_ref=transfer_ref,
         )
 
     async def _forward_results(self, results: list[tuple[InferenceInput, Any | Exception]]) -> int:

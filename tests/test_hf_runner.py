@@ -7,6 +7,7 @@ import torch
 from torchspec.config.inference_config import HFInferenceConfig
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.inference.engine.hf_runner import HFRunner
+from torchspec.transfer.base import TransferBackend, TransferRef, TransferRole, TransferState
 
 
 class MockMooncakeStore:
@@ -15,10 +16,12 @@ class MockMooncakeStore:
     def __init__(self, config: MooncakeConfig):
         self.config = config
         self._setup_called = False
+        self.setup_calls = 0
         self._closed = False
 
     def setup(self, device):
         self._setup_called = True
+        self.setup_calls += 1
         self._device = device
 
     def close(self):
@@ -32,6 +35,37 @@ class MockMooncakeStore:
             k: torch.zeros(s, dtype=dtypes.get(k, torch.float32), device=device)
             for k, s in shapes.items()
         }
+
+
+class TrackingTransferBackend(TransferBackend):
+    """Minimal generic backend whose setup lifecycle can be asserted."""
+
+    def __init__(self):
+        super().__init__()
+        self.setup_calls = 0
+        self.setup_device = None
+
+    def _setup(self, role, device):
+        self.setup_calls += 1
+        self.setup_device = device
+
+    def _put(self, object_id, tensors, expected_consumers):
+        raise NotImplementedError
+
+    def _flush(self):
+        pass
+
+    def _get(self, ref, device):
+        raise NotImplementedError
+
+    def _release(self, ref: TransferRef):
+        pass
+
+    def _health_check(self):
+        pass
+
+    def _close(self):
+        pass
 
 
 class TestHFRunnerInitMooncakeStore:
@@ -141,10 +175,77 @@ class TestHFRunnerInitMooncakeStore:
         existing_store = MockMooncakeStore(mooncake_config)
         engine = HFRunner(config=config, mooncake_store=existing_store)
 
-        with patch.object(engine, "_setup_target_model"):
+        with (
+            patch.object(engine, "_setup_target_model"),
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.cuda.current_device", side_effect=AssertionError("CUDA probed")),
+        ):
             engine.setup()
 
         assert engine.mooncake_store is existing_store
+        assert existing_store.setup_calls == 0
+        assert engine.transfer_backend is not None
+        assert engine.transfer_backend.state is TransferState.READY
+        assert engine.transfer_backend.role is TransferRole.PRODUCER
+
+    def test_setup_initializes_caller_provided_generic_backend(self):
+        """A NEW generic backend is ready before generate can call put."""
+        config = HFInferenceConfig(model_path="/fake/path")
+        backend = TrackingTransferBackend()
+        engine = HFRunner(config=config, transfer_backend=backend)
+
+        with (
+            patch.object(engine, "_setup_target_model"),
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.cuda.current_device", side_effect=AssertionError("CUDA probed")),
+        ):
+            engine.setup()
+
+        assert backend.state is TransferState.READY
+        assert backend.role is TransferRole.PRODUCER
+        assert backend.setup_calls == 1
+        assert backend.setup_device is None
+
+    def test_generic_backend_takes_precedence_over_legacy_mooncake_config(self):
+        """Legacy config must not replace an explicitly supplied backend."""
+        config = HFInferenceConfig(
+            model_path="/fake/path",
+            mooncake_config=MooncakeConfig(master_server_address="localhost:50051"),
+        )
+        backend = TrackingTransferBackend()
+        engine = HFRunner(config=config, transfer_backend=backend)
+
+        with (
+            patch.object(engine, "_setup_target_model"),
+            patch(
+                "torchspec.inference.engine.hf_runner.EagleMooncakeStore",
+                side_effect=AssertionError("Mooncake store created"),
+            ),
+            patch("torch.cuda.is_available", return_value=False),
+        ):
+            engine.setup()
+
+        assert engine.transfer_backend is backend
+        assert engine.mooncake_store is None
+        assert backend.state is TransferState.READY
+
+    def test_setup_does_not_reinitialize_ready_generic_backend(self):
+        """A preinitialized generic producer remains untouched."""
+        config = HFInferenceConfig(model_path="/fake/path")
+        backend = TrackingTransferBackend()
+        backend.setup(TransferRole.PRODUCER, "cpu")
+        engine = HFRunner(config=config, transfer_backend=backend)
+
+        with (
+            patch.object(engine, "_setup_target_model"),
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.cuda.current_device", side_effect=AssertionError("CUDA probed")),
+        ):
+            engine.setup()
+
+        assert backend.state is TransferState.READY
+        assert backend.setup_calls == 1
+        assert backend.setup_device == "cpu"
 
     def test_shutdown_closes_mooncake_store(self):
         """Test shutdown() closes the mooncake store."""

@@ -43,7 +43,7 @@ from torchspec.config.utils import generate_draft_model_config
 from torchspec.controller import (
     AsyncTrainingController,
     auto_calculate_training_steps,
-    build_mooncake_config,
+    build_transfer_config,
     run_training_loop,
     setup_async_training_with_engines,
 )
@@ -321,8 +321,9 @@ def train_async_no_generation(args):
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
         pgs = create_placement_groups(args)
-        launch_mooncake_master(args)
-        mooncake_config = build_mooncake_config(args)
+        if str(getattr(args, "transfer_backend", "mooncake")).lower() == "mooncake":
+            launch_mooncake_master(args)
+        transfer_config = build_transfer_config(args)
 
     # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
     dataset_size, eval_dataset_size = timer.wait(
@@ -363,7 +364,7 @@ def train_async_no_generation(args):
             training_class=TrainerActor,
         )
         train_init_refs = train_group.async_init(
-            args, role="training", mooncake_config=mooncake_config, with_ref=False
+            args, role="training", mooncake_config=transfer_config, with_ref=False
         )
 
         # Decode mode: create scratch draft checkpoint before inference engines
@@ -373,7 +374,7 @@ def train_async_no_generation(args):
         _maybe_create_scratch_draft(args, train_group)
 
         inference_engines, engine_init_refs = prepare_inference_engines(
-            args, pgs["inference"], mooncake_config
+            args, pgs["inference"], transfer_config
         )
 
     # [8] Wait for all actor init to complete concurrently
@@ -397,7 +398,7 @@ def train_async_no_generation(args):
     # [9] Setup async training with pre-created controller
     with timer.phase("Setup async training"):
         controller, inference_manager = setup_async_training_with_engines(
-            args, train_group, mooncake_config, inference_engines, controller=controller
+            args, train_group, transfer_config, inference_engines, controller=controller
         )
 
     timer.log_summary()

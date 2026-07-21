@@ -27,12 +27,64 @@ import traceback
 import torch
 
 
+def resolve_stored_tensor_metadata(meta, store, hidden_size, num_aux_layers):
+    """Resolve the tensors the producer says it actually stored.
+
+    New patched servers provide an authoritative serialized ``TransferRef``.
+    The legacy protocol only provides a base key, so optional tensors must be
+    discovered instead of being unconditionally assumed by the smoke test.
+    """
+    transfer_refs = meta.get("spec_training_transfer_refs", [])
+    store_keys = meta.get("spec_training_mooncake_store_keys", [])
+    if transfer_refs:
+        try:
+            from torchspec.transfer import TransferRef
+        except ImportError:
+            # A clean baseline checkout predates the transfer interface. Its
+            # response only has legacy Mooncake keys, so continue below.
+            print(
+                "  NOTE: TransferRef is unavailable in this TorchSpec version; "
+                "using legacy Mooncake metadata discovery"
+            )
+        else:
+            ref = TransferRef.from_dict(transfer_refs[0])
+            if ref.backend != "mooncake":
+                raise AssertionError(f"Expected Mooncake transfer ref, got {ref.backend!r}")
+            shapes = {name: spec.shape for name, spec in ref.tensors.items()}
+            dtypes = {name: getattr(torch, spec.dtype) for name, spec in ref.tensors.items()}
+            return ref.object_id, shapes, dtypes
+
+    if not store_keys:
+        raise AssertionError("No Mooncake store keys or transfer references returned")
+
+    key = store_keys[0]
+    seq_len = meta.get("prompt_tokens", 10)
+    shapes = {
+        "hidden_states": (seq_len, num_aux_layers * hidden_size),
+        "input_ids": (seq_len,),
+    }
+    dtypes = {
+        "hidden_states": torch.bfloat16,
+        "input_ids": torch.int64,
+    }
+    if store.exists(f"{key}_lhs"):
+        shapes["last_hidden_states"] = (seq_len, hidden_size)
+        dtypes["last_hidden_states"] = torch.bfloat16
+    else:
+        print(
+            "  NOTE: legacy SGLang response did not store last_hidden_states; "
+            "validating the tensors that are present"
+        )
+    return key, shapes, dtypes
+
+
 def find_free_port(start=10000, end=60000):
     for port in range(start, end):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.bind(("", port))
-            s.close()
+            # Mooncake master and SGLang listen on TCP.  Probing UDP allowed
+            # concurrent jobs on the same Slurm node to choose the same port.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("", port))
             return port
         except OSError:
             continue
@@ -177,7 +229,8 @@ def test_spec_training(model_path, aux_layer_ids=None):
     print(f"  mooncake store keys: {store_keys}")
     print(f"  prompt_tokens: {meta.get('prompt_tokens')}")
 
-    assert len(store_keys) > 0, "No mooncake store keys returned"
+    transfer_refs = meta.get("spec_training_transfer_refs", [])
+    assert store_keys or transfer_refs, "No Mooncake store keys or transfer references returned"
 
     # --- Retrieve from mooncake and verify ---
     print("\n=== Retrieving hidden states from mooncake ===")
@@ -191,20 +244,9 @@ def test_spec_training(model_path, aux_layer_ids=None):
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     hidden_size = config.hidden_size
 
-    seq_len = meta.get("prompt_tokens", 10)
-    concat_hidden_size = num_aux_layers * hidden_size
-
-    shapes = {
-        "hidden_states": (seq_len, concat_hidden_size),
-        "input_ids": (seq_len,),
-        "last_hidden_states": (seq_len, hidden_size),
-    }
-    dtypes = {
-        "hidden_states": torch.bfloat16,
-        "last_hidden_states": torch.bfloat16,
-    }
-
-    key = store_keys[0]
+    key, shapes, dtypes = resolve_stored_tensor_metadata(
+        meta, mc_store, hidden_size, num_aux_layers
+    )
     print(f"  Retrieving key: {key}")
     print(f"  Expected shapes: {shapes}")
 
@@ -229,14 +271,19 @@ def test_spec_training(model_path, aux_layer_ids=None):
     assert tuple(ids.shape) == shapes["input_ids"], (
         f"input_ids shape mismatch: {tuple(ids.shape)} != {shapes['input_ids']}"
     )
-    assert lhs is not None, "last_hidden_states should not be None"
-    assert tuple(lhs.shape) == shapes["last_hidden_states"], (
-        f"last_hidden_states shape mismatch: {tuple(lhs.shape)} != {shapes['last_hidden_states']}"
-    )
+    if "last_hidden_states" in shapes:
+        assert lhs is not None, "last_hidden_states metadata was present but tensor is missing"
+        assert tuple(lhs.shape) == shapes["last_hidden_states"], (
+            f"last_hidden_states shape mismatch: {tuple(lhs.shape)} "
+            f"!= {shapes['last_hidden_states']}"
+        )
+    else:
+        assert lhs is None
 
     # --- Verify non-zero ---
     assert not torch.all(hs == 0), "hidden_states is all zeros"
-    assert not torch.all(lhs == 0), "last_hidden_states is all zeros"
+    if lhs is not None:
+        assert not torch.all(lhs == 0), "last_hidden_states is all zeros"
     assert not torch.all(ids == 0), "input_ids is all zeros"
 
     # --- Verify input_ids are valid token IDs ---
@@ -246,15 +293,19 @@ def test_spec_training(model_path, aux_layer_ids=None):
     # --- Verify hidden states have reasonable values (not NaN/Inf) ---
     assert not torch.any(torch.isnan(hs)), "hidden_states contains NaN"
     assert not torch.any(torch.isinf(hs)), "hidden_states contains Inf"
-    assert not torch.any(torch.isnan(lhs)), "last_hidden_states contains NaN"
-    assert not torch.any(torch.isinf(lhs)), "last_hidden_states contains Inf"
+    if lhs is not None:
+        assert not torch.any(torch.isnan(lhs)), "last_hidden_states contains NaN"
+        assert not torch.any(torch.isinf(lhs)), "last_hidden_states contains Inf"
 
     print(f"\n  hidden_states norm: {hs.float().norm():.4f}")
-    print(f"  last_hidden_states norm: {lhs.float().norm():.4f}")
+    if lhs is not None:
+        print(f"  last_hidden_states norm: {lhs.float().norm():.4f}")
     print(f"  input_ids sample: {ids[:10].tolist()}")
 
     # --- Cleanup ---
-    mc_store.remove_eagle3_tensors(key, has_last_hidden_states=True)
+    mc_store.remove_eagle3_tensors(
+        key, has_last_hidden_states="last_hidden_states" in shapes
+    )
     mc_store.close()
     engine.shutdown()
 

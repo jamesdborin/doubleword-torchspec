@@ -40,6 +40,7 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
@@ -102,6 +103,11 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"using local GPU {self.local_gpu_id}"
             )
 
+        if mooncake_config is not None and not isinstance(mooncake_config, MooncakeConfig):
+            raise NotImplementedError(
+                "vLLM inference currently supports only the Mooncake transfer backend; "
+                "use inference_engine_type=hf or sgl for UCCL-P2P"
+            )
         self._mooncake_config = mooncake_config
 
         if mooncake_config is not None:

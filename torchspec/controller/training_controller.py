@@ -137,7 +137,7 @@ class AsyncTrainingController:
         self.sample_pool: deque[InferenceOutput] = deque()
         self._pool_lock = threading.Lock()
         self._pool_bytes = 0
-        self._sample_bytes: dict[str, int] = {}
+        self._sample_bytes: dict[tuple[str, str], int] = {}
 
         self.train_queues = [Queue() for _ in range(self.queue_count)]
 
@@ -373,11 +373,8 @@ class AsyncTrainingController:
         if train_results:
             with self._pool_lock:
                 for result in train_results:
-                    sample_bytes = estimate_tensor_bytes(
-                        result.tensor_shapes or {},
-                        result.tensor_dtypes or {},
-                    )
-                    self._sample_bytes[result.mooncake_key] = sample_bytes
+                    sample_bytes = result.transfer_ref.nbytes
+                    self._sample_bytes[result.transfer_identity] = sample_bytes
                     self._pool_bytes += sample_bytes
                 self.sample_pool.extend(train_results)
                 pool_bytes = self._pool_bytes
@@ -458,7 +455,7 @@ class AsyncTrainingController:
             batch_results = []
             for _ in range(self.dispatch_batch_size):
                 result = self.sample_pool.popleft()
-                sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
+                sample_bytes = self._sample_bytes.pop(result.transfer_identity, 0)
                 self._pool_bytes -= sample_bytes
                 batch_results.append(result)
 
@@ -524,6 +521,7 @@ class AsyncTrainingController:
                     packed_loss_mask=result.packed_loss_mask,
                     last_turn_loss_only=last_turn_loss_only,
                     metadata=metadata,
+                    transfer_ref=result.transfer_ref,
                 )
                 if self.sp_size > 1 and len(queues) == self.queue_count:
                     start = dp_rank * self.sp_size

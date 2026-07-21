@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 import abc
 import concurrent.futures
 import dataclasses
@@ -27,7 +29,7 @@ import os
 import time
 from argparse import Namespace
 from contextlib import nullcontext
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed as dist
@@ -40,15 +42,19 @@ from torch.distributed.device_mesh import init_device_mesh
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.data.utils import DataCollatorWithPadding
 from torchspec.training import checkpoint
-from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
+from torchspec.training.data_fetcher import PrefetchedDataFetcher, TransferDataFetcher
 from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.optimizer import BF16Optimizer
-from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+from torchspec.transfer.base import TransferBackend, TransferRole
+from torchspec.transfer.factory import create_transfer_backend
 from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
 from torchspec.utils.train_dump import extract_gradients, extract_model_weights
+
+if TYPE_CHECKING:
+    from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
 
 class Trainer(abc.ABC):
@@ -72,9 +78,10 @@ class Trainer(abc.ABC):
         self.draft_model = None
         self.optimizer: Optional[BF16Optimizer] = None
         self.lr_scheduler = None
-        self.data_fetcher: Optional[MooncakeDataFetcher] = None
+        self.data_fetcher: Optional[TransferDataFetcher] = None
         self.train_queue = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
+        self.transfer_backend: Optional[TransferBackend] = None
         self._eval_cache: list[dict] = []
 
         self.prof = TrainProfiler(args)
@@ -151,6 +158,8 @@ class Trainer(abc.ABC):
         self,
         mooncake_config: Optional[MooncakeConfig] = None,
     ) -> EagleMooncakeStore:
+        from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+
         if mooncake_config is None:
             mooncake_config = MooncakeConfig.from_flat_args(self.args)
 
@@ -161,10 +170,29 @@ class Trainer(abc.ABC):
         )
 
         store = EagleMooncakeStore(mooncake_config)
-        store.setup(device=torch.cuda.current_device())
+        from torchspec.transfer.mooncake.backend import MooncakeTransferBackend
+
+        backend = MooncakeTransferBackend(store)
+        backend.setup(TransferRole.CONSUMER, torch.cuda.current_device())
         self.mooncake_store = store
+        self.transfer_backend = backend
         logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore initialized")
         return store
+
+    def init_transfer_backend(self, transfer_config) -> TransferBackend:
+        """Initialize the selected consumer backend on this training rank."""
+        if isinstance(transfer_config, MooncakeConfig):
+            self.init_mooncake_store(transfer_config)
+            assert self.transfer_backend is not None
+            return self.transfer_backend
+
+        backend = create_transfer_backend(transfer_config)
+        backend.setup(TransferRole.CONSUMER, torch.cuda.current_device())
+        self.transfer_backend = backend
+        logger.info(
+            f"[Rank {self.dp_rank}] {type(backend).__name__} transfer backend initialized"
+        )
+        return backend
 
     # ------------------------------------------------------------------
     # Data queue
@@ -181,8 +209,8 @@ class Trainer(abc.ABC):
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
         if usp_enabled and per_dp_rank_batch_size != 1:
             raise ValueError("USP requires per_dp_rank_batch_size=1")
-        if mooncake_config is not None and self.mooncake_store is None:
-            self.init_mooncake_store(mooncake_config)
+        if mooncake_config is not None and self.transfer_backend is None:
+            self.init_transfer_backend(mooncake_config)
 
         collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
@@ -193,9 +221,9 @@ class Trainer(abc.ABC):
         # background Mooncake TCP transfers and forward/backward compute.
         fetch_device = "cpu" if prefetch_depth > 0 else gpu_device
 
-        inner_fetcher = MooncakeDataFetcher(
+        inner_fetcher = TransferDataFetcher(
             queue=self.train_queue,
-            mooncake_store=self.mooncake_store,
+            transfer_backend=self.transfer_backend,
             collator=collator,
             device=fetch_device,
             batch_size=per_dp_rank_batch_size,
@@ -238,14 +266,14 @@ class Trainer(abc.ABC):
         per_dp_rank_batch_size: int = 1,
     ) -> None:
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
-        if mooncake_config is not None and self.mooncake_store is None:
-            self.init_mooncake_store(mooncake_config)
+        if mooncake_config is not None and self.transfer_backend is None:
+            self.init_transfer_backend(mooncake_config)
 
         collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
-        self._eval_data_fetcher = MooncakeDataFetcher(
+        self._eval_data_fetcher = TransferDataFetcher(
             queue=queue,
-            mooncake_store=self.mooncake_store,
+            transfer_backend=self.transfer_backend,
             collator=collator,
             device=torch.cuda.current_device(),
             batch_size=per_dp_rank_batch_size,
@@ -484,9 +512,11 @@ class Trainer(abc.ABC):
     def close(self) -> None:
         self._wait_for_eval_cache_save()
         self._io_executor.shutdown(wait=True)
-        if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
-            self.mooncake_store.close()
-            logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore closed")
+        if self.transfer_backend is not None:
+            self.transfer_backend.close()
+            logger.info(f"[Rank {self.dp_rank}] transfer backend closed")
+            self.transfer_backend = None
+            self.mooncake_store = None
 
     # ------------------------------------------------------------------
     # Debug logging & dump helpers

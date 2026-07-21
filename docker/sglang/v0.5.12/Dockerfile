@@ -4,9 +4,11 @@ FROM ${SGLANG_IMAGE} AS sglang
 WORKDIR /root/
 
 COPY patches/sglang/v0.5.12/sglang.patch /sgl-workspace/
+COPY patches/sglang/v0.5.12/transfer_backend.patch /sgl-workspace/
 RUN cd /sgl-workspace/sglang && \
     git apply /sgl-workspace/sglang.patch && \
-    rm /sgl-workspace/sglang.patch && \
+    git apply /sgl-workspace/transfer_backend.patch && \
+    rm /sgl-workspace/sglang.patch /sgl-workspace/transfer_backend.patch && \
     cd python && pip install -e .
 
 COPY . /root/torchspec

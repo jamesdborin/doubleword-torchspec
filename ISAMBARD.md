@@ -320,3 +320,35 @@ second full-node allocation.
   z-lab) and the same exactly-nine-series plot. Remote artifacts:
   `$SCRATCH/torchspec-qwen35-9b/outputs/dflash-speed-bench-checkpoint-sweep.{csv,png}`.
   Updated local copies are under `artifacts/isambard/`.
+
+## 2026-07-20: Transfer-backend extraction and UCCL-P2P/CXI validation
+
+- Added the backend-neutral `TransferBackend`, `TensorSpec`, and `TransferRef`
+  contracts. Mooncake now runs through `MooncakeTransferBackend`; legacy
+  Mooncake keys and metadata remain compatible while controller accounting and
+  training retrieval use `TransferRef`.
+- Added an optional UCCL-P2P backend using only the low-level CXI-compatible
+  API (`regv`, `advertisev`, `readv_async`, `poll_async`). Pinned-host staging
+  is the default. Producer memory registrations are retained until a consumer
+  ACK or TTL cleanup. The tested source pin is
+  `4312141c93c4b2f3ff7b9f274ad58c355c14fab6` (minimum supported commit
+  `51d91bceabf27be88fc9198cf79b6d4e702bed73`).
+- Added a second SGLang v0.5.12 patch that propagates serialized transfer refs
+  and constructs the selected backend in the scheduler child. HF and patched
+  SGLang support UCCL; vLLM and USP-sharded transfers remain Mooncake-only.
+- Local focused regression is green: 100 tests passed, Ruff passed, Python
+  compilation passed, both SGLang patches applied cleanly to upstream v0.5.12,
+  and the patched upstream tree compiled.
+- Staged the integration revision at
+  `$SCRATCH/torchspec-uccl/integration-20260720/source`. Slurm jobs submitted:
+  baseline Mooncake `5729011`, raw single-node CXI `5729087`, updated focused
+  Mooncake/SGLang regression `5729279`, TorchSpec UCCL single-node `5729258`,
+  and TorchSpec UCCL two-node `5729259`. The UCCL integration jobs depend on
+  successful completion of the raw build/transport job. At submission time the
+  independent jobs were pending for priority with an estimated start around
+  2026-07-21 09:26 UTC; a monitoring subagent is checking every 10–20 minutes.
+- Reusable install, Apptainer/CXI bind, raw transport, and TorchSpec backend
+  smoke scripts are in `examples/uccl-isambard/`. They bind Cray libfabric
+  1.22, `libcxi`, `libnl`, and `/dev/cxi*`, and set
+  `UCCL_P2P_TRANSPORT=cxi`, `UCCL_SOCKET_IFNAME=hsn0`, and
+  `UCCL_LIBFABRIC_SO=/opt/cray/libfabric/1.22.0/lib64/libfabric.so.1`.

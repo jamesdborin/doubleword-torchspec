@@ -297,8 +297,9 @@ class SglDecodeEngineMixin:
         # the zip(entries, outputs, strict=True) in the inference manager.
         for result_index, result in enumerate(results):
             i = active_indices[result_index]
+            transfer_refs = result["meta_info"].get("spec_training_transfer_refs", [])
             store_keys = result["meta_info"].get("spec_training_mooncake_store_keys", [])
-            if not store_keys:
+            if not transfer_refs and not store_keys:
                 logger.warning(
                     f"SglEngine rank {self.rank}: No mooncake keys returned for "
                     f"data_id={active_data_ids[result_index]}, skipping this sample."
@@ -317,7 +318,8 @@ class SglDecodeEngineMixin:
                     metrics_msg += f", spec_accept_length={meta_info['spec_accept_length']:.2f}"
                 logger.debug(metrics_msg)
 
-            key = store_keys[0]
+            transfer_ref = transfer_refs[0] if transfer_refs else None
+            key = transfer_ref.get("object_id") if transfer_ref is not None else store_keys[0]
             prompt_tokens = meta_info.get("prompt_tokens", 0)
             completion_tokens = meta_info.get("completion_tokens", 0)
             output_ids = result.get("output_ids", [])
@@ -359,11 +361,15 @@ class SglDecodeEngineMixin:
                 loss_mask = serialize_packed_loss_mask([prompt_tokens])
 
             output_dict = {
-                "mooncake_key": key,
-                "tensor_shapes": tensor_shapes,
-                "tensor_dtypes": self._get_tensor_dtypes(),
+                "transfer_ref": transfer_ref,
                 "packed_loss_mask": loss_mask,
             }
+            if transfer_ref is None:
+                output_dict.update(
+                    mooncake_key=key,
+                    tensor_shapes=tensor_shapes,
+                    tensor_dtypes=self._get_tensor_dtypes(),
+                )
             if getattr(self.args, "attention_backend", None) == "usp":
                 output_dict["metadata"] = {"usp_sharded": True}
 

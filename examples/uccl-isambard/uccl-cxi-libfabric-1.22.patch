@@ -1,0 +1,28 @@
+diff --git a/p2p/cxi/cxi_endpoint.cc b/p2p/cxi/cxi_endpoint.cc
+index fbc7cbd..ba0d40e 100644
+--- a/p2p/cxi/cxi_endpoint.cc
++++ b/p2p/cxi/cxi_endpoint.cc
+@@ -209,18 +209,8 @@ void CxiEndpoint::init_fabric(int gpu_index) {
+   hints->ep_attr->type = FI_EP_RDM;
+-  hints->caps = FI_TAGGED | FI_MSG | FI_HMEM | FI_RMA | FI_READ | FI_WRITE |
+-                FI_REMOTE_WRITE | FI_REMOTE_READ | FI_LOCAL_COMM |
+-                FI_REMOTE_COMM;
+-  hints->mode = FI_CONTEXT | FI_CONTEXT2;
+-  hints->domain_attr->threading = threading_hint();
+-  hints->domain_attr->control_progress = FI_PROGRESS_UNSPEC;
+-  hints->domain_attr->data_progress = FI_PROGRESS_UNSPEC;
+-  hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_ENDPOINT |
+-                                FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
+-                                FI_MR_PROV_KEY;
+-  hints->domain_attr->mr_key_size = 2;
+-  hints->tx_attr->size = cxi_size_env("UCCL_CXI_TX_QUEUE_SIZE", 4096);
+-  hints->rx_attr->size = cxi_size_env("UCCL_CXI_RX_QUEUE_SIZE", 4096);
+-  hints->tx_attr->msg_order = FI_ORDER_SAS;
+-  hints->rx_attr->msg_order = FI_ORDER_SAS;
++  // Cray libfabric 1.22 expects wildcard negotiation for these fields. Zero
++  // (the fi_allocinfo default) and newer UCCL's strict defaults both make
++  // fi_getinfo return ENODATA on Isambard.
++  hints->mode = UINT64_MAX;
++  hints->domain_attr->mr_mode = ~(FI_MR_BASIC | FI_MR_SCALABLE);
+
+   try {
