@@ -28,7 +28,6 @@ Accepts pre-tokenized input_ids and loss_mask from batch preprocessing.
 """
 
 import os
-import socket
 from typing import Any
 
 import ray
@@ -36,10 +35,11 @@ import sglang as sgl
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.sgl_engine_decode import SglDecodeEngineMixin
 from torchspec.ray.ray_actor import RayActor
-from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE
+from torchspec.transfer.constants import HIDDEN_STATES_STORAGE_DTYPE
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
@@ -157,39 +157,35 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         self._mooncake_config = mooncake_config
         if mooncake_config is not None:
-            logger.info(f"SglEngine rank {self.rank}: received mooncake_config={mooncake_config}")
+            logger.info(f"SglEngine rank {self.rank}: received transfer_config={mooncake_config}")
 
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                local_ip = "localhost"
-                logger.warning(
-                    f"SglEngine rank {self.rank}: failed to get local IP, using localhost"
-                )
+            local_ip = self.get_node_ip()
 
-            mooncake_config.local_hostname = local_ip
+            if hasattr(mooncake_config, "local_hostname"):
+                mooncake_config.local_hostname = local_ip
+            if hasattr(mooncake_config, "ack_advertise_host"):
+                mooncake_config.ack_advertise_host = local_ip
             mooncake_config.export_env()
 
-            logger.info(
-                f"SglEngine rank {self.rank}: mooncake env vars set - "
-                f"local_hostname={local_ip}, "
-                f"master_server={mooncake_config.master_server_address}, "
-                f"metadata_server={mooncake_config.metadata_server}, "
-                f"protocol={mooncake_config.protocol}, "
-                f"device_name={mooncake_config.device_name}"
-            )
+            if isinstance(mooncake_config, MooncakeConfig):
+                logger.info(
+                    f"SglEngine rank {self.rank}: Mooncake env vars set - "
+                    f"local_hostname={local_ip}, "
+                    f"master_server={mooncake_config.master_server_address}, "
+                    f"metadata_server={mooncake_config.metadata_server}, "
+                    f"protocol={mooncake_config.protocol}, "
+                    f"device_name={mooncake_config.device_name}"
+                )
+                from torchspec.transfer.mooncake.utils import (
+                    check_mooncake_master_available,
+                )
 
-            from torchspec.transfer.mooncake.utils import (
-                check_mooncake_master_available,
-            )
-
-            check_mooncake_master_available(
-                mooncake_config.master_server_address,
-                mooncake_config.metadata_server,
-            )
+                check_mooncake_master_available(
+                    mooncake_config.master_server_address,
+                    mooncake_config.metadata_server,
+                )
+            elif getattr(self.args, "attention_backend", None) == "usp":
+                raise NotImplementedError("UCCL-P2P does not yet support USP-sharded transfers")
 
         self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
 
@@ -457,13 +453,14 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         results = self._engine.generate(**engine_kwargs)
 
-        # Extract mooncake keys and construct shapes based on actual sequence length
+        # Extract backend-neutral references (with a legacy Mooncake fallback).
         outputs = []
         for i, result in enumerate(results):
+            transfer_refs = result["meta_info"].get("spec_training_transfer_refs", [])
             store_keys = result["meta_info"].get("spec_training_mooncake_store_keys", [])
-            if not store_keys:
+            if not transfer_refs and not store_keys:
                 logger.error(
-                    f"SglEngine rank {self.rank}: ERROR: No mooncake keys returned for "
+                    f"SglEngine rank {self.rank}: ERROR: No transfer references returned for "
                     f"data_id={data_ids[i]}. Training may be corrupted."
                 )
                 continue
@@ -472,7 +469,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 f"SglEngine rank {self.rank}: result meta_info keys: {list(result['meta_info'].keys())}"
             )
 
-            for key in store_keys:
+            entries = transfer_refs or store_keys
+            for entry in entries:
                 seq_len = result["meta_info"].get("prompt_tokens")
                 if seq_len is None:
                     if use_prompts:
@@ -485,16 +483,21 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                         seq_len = len(input_ids_list_of_lists[i])
 
                 tensor_shapes = self._get_tensor_shapes(seq_len)
+                key = entry.get("object_id") if isinstance(entry, dict) else entry
                 logger.debug(
                     f"SglEngine rank {self.rank}: mooncake_key={key}, seq_len={seq_len}, "
                     f"tensor_shapes={tensor_shapes}"
                 )
 
                 output = {
-                    "mooncake_key": key,
-                    "tensor_shapes": tensor_shapes,
-                    "tensor_dtypes": self._get_tensor_dtypes(),
+                    "transfer_ref": entry if isinstance(entry, dict) else None,
                 }
+                if not isinstance(entry, dict):
+                    output.update(
+                        mooncake_key=key,
+                        tensor_shapes=tensor_shapes,
+                        tensor_dtypes=self._get_tensor_dtypes(),
+                    )
                 if getattr(self.args, "attention_backend", None) == "usp":
                     output["metadata"] = {"usp_sharded": True}
                 outputs.append(output)

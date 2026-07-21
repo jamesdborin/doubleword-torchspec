@@ -41,6 +41,10 @@ def __getattr__(name):
         from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
         return EagleMooncakeStore
+    if name == "MooncakeTransferBackend":
+        from torchspec.transfer.mooncake.backend import MooncakeTransferBackend
+
+        return MooncakeTransferBackend
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -49,6 +53,7 @@ __all__ = [
     "MooncakeMaster",
     "MooncakeHiddenStateStore",
     "EagleMooncakeStore",
+    "MooncakeTransferBackend",
     "calculate_eagle3_buffer_size",
     "resolve_mooncake_master_bin",
     "check_mooncake_master_available",

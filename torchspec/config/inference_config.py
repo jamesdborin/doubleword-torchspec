@@ -144,3 +144,4 @@ class HFInferenceConfig:
     trust_remote_code: bool = False
     aux_hidden_states_layers: Optional[list[int]] = None
     mooncake_config: Optional[MooncakeConfig] = None
+    transfer_config: Any = None

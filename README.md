@@ -1,6 +1,6 @@
 # TorchSpec
 
-TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers via [Mooncake](https://github.com/kvcache-ai/Mooncake) store, allowing each side to scale independently.
+TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers through a pluggable transfer backend, allowing each side to scale independently. [Mooncake](https://github.com/kvcache-ai/Mooncake) is the default; UCCL-P2P is available for Slingshot/CXI deployments.
 
 TorchSpec currently includes training flows and examples for:
 
@@ -51,7 +51,7 @@ Draft models trained with TorchSpec, available from other organizations:
 TorchSpec is built around a disaggregated training pipeline:
 
 - **Inference engines** generate target-model hidden states with inference engines.
-- **Mooncake store** transfers tensors between inference and training without materializing them on disk.
+- **Pluggable tensor transfer** uses Mooncake by default, with UCCL-P2P as a CXI-capable alternative, without materializing tensors on disk. See [transfer backend documentation](docs/transfer_backends.md).
 - **Training workers** consume streamed hidden states to train speculative decoding draft models.
 
 This separation keeps the training side focused on optimization while letting the inference side scale for hidden-state generation throughput.

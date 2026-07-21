@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Pipeline setup: mooncake config, training steps calculation, async training setup."""
+"""Pipeline setup: transfer config, training steps calculation, async training setup."""
 
 import math
 
@@ -35,8 +35,20 @@ def build_mooncake_config(args):
     return MooncakeConfig.from_flat_args(args)
 
 
+def build_transfer_config(args):
+    """Build the selected backend's serializable configuration."""
+    backend = str(getattr(args, "transfer_backend", "mooncake")).lower()
+    if backend == "mooncake":
+        return build_mooncake_config(args)
+    if backend in {"uccl", "uccl-p2p"}:
+        from torchspec.transfer.uccl import UcclConfig
+
+        return UcclConfig.from_flat_args(args)
+    raise ValueError(f"Unknown transfer backend: {backend!r}")
+
+
 def setup_async_training_with_engines(
-    args, train_group, mooncake_config, inference_engines, controller=None
+    args, train_group, transfer_config, inference_engines, controller=None
 ):
     """Setup async training with distributed inference engines (e.g., Eagle3).
 
@@ -46,7 +58,7 @@ def setup_async_training_with_engines(
     Args:
         args: Configuration arguments.
         train_group: Training group.
-        mooncake_config: MooncakeConfig object. Each actor initializes its own store.
+        transfer_config: Configuration for the selected transfer backend.
         inference_engines: List of Ray actor engine handles for distributed generation.
         controller: Optional pre-created AsyncTrainingController. If None, a new one is created.
     """
@@ -76,13 +88,13 @@ def setup_async_training_with_engines(
 
     train_queues = ray.get(controller.get_train_queues.remote())
     train_group.set_train_queues(
-        train_queues, mooncake_config, per_dp_rank_batch_size=args.per_dp_rank_batch_size
+        train_queues, transfer_config, per_dp_rank_batch_size=args.per_dp_rank_batch_size
     )
 
     eval_queues = ray.get(controller.get_eval_queues.remote())
     # eval_from_cache re-collates individual samples with eval_micro_batch_size,
     # so the fetcher must yield unbatched (batch_size=1) entries.
-    train_group.set_eval_queues(eval_queues, mooncake_config, per_dp_rank_batch_size=1)
+    train_group.set_eval_queues(eval_queues, transfer_config, per_dp_rank_batch_size=1)
 
     return controller, inference_manager
 

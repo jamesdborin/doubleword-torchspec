@@ -36,8 +36,18 @@ import torch.distributed as dist
 from torchspec.config.inference_config import HFInferenceConfig
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.models.target import HFTargetModel
+from torchspec.transfer.base import TransferBackend, TransferRole
+from torchspec.transfer.factory import create_transfer_backend
+from torchspec.transfer.mooncake.backend import MooncakeTransferBackend
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.utils.logging import logger
+
+
+class _PreinitializedMooncakeTransferBackend(MooncakeTransferBackend):
+    """Adapt a caller-owned store without invoking its setup hook again."""
+
+    def _setup(self, role: TransferRole, device: torch.device | str | int | None) -> None:
+        del role, device
 
 
 class HFRunner:
@@ -55,6 +65,7 @@ class HFRunner:
         self,
         config: HFInferenceConfig,
         mooncake_store: Optional[EagleMooncakeStore] = None,
+        transfer_backend: Optional[TransferBackend] = None,
     ):
         """
         Args:
@@ -65,6 +76,7 @@ class HFRunner:
         """
         self.config = config
         self.mooncake_store = mooncake_store
+        self.transfer_backend = transfer_backend
         self.target_model: Optional[HFTargetModel] = None
         self._initialized = False
 
@@ -90,8 +102,10 @@ class HFRunner:
             )
 
         store = EagleMooncakeStore(mooncake_config)
-        store.setup(device=torch.cuda.current_device())
+        backend = MooncakeTransferBackend(store)
+        backend.setup(TransferRole.PRODUCER, self._producer_device())
         self.mooncake_store = store
+        self.transfer_backend = backend
 
         tp_rank = self._get_tp_rank()
         logger.info(f"[Rank {tp_rank}] EagleMooncakeStore initialized")
@@ -108,6 +122,8 @@ class HFRunner:
         aux_hidden_states_layers: Optional[list[int]] = None,
         mooncake_config: Optional[MooncakeConfig] = None,
         mooncake_store: Optional[EagleMooncakeStore] = None,
+        transfer_config: Any = None,
+        transfer_backend: Optional[TransferBackend] = None,
         **kwargs,
     ) -> "HFRunner":
         """Create HFRunner from a pretrained model path.
@@ -138,15 +154,35 @@ class HFRunner:
             trust_remote_code=trust_remote_code,
             aux_hidden_states_layers=aux_hidden_states_layers,
             mooncake_config=mooncake_config,
+            transfer_config=transfer_config,
         )
 
-        engine = cls(config=config, mooncake_store=mooncake_store)
+        engine = cls(
+            config=config,
+            mooncake_store=mooncake_store,
+            transfer_backend=transfer_backend,
+        )
         engine.setup()
         return engine
 
     def set_mooncake_store(self, mooncake_store) -> None:
         """Set or update the mooncake store for tensor storage."""
         self.mooncake_store = mooncake_store
+        backend = _PreinitializedMooncakeTransferBackend(mooncake_store)
+        backend.setup(TransferRole.PRODUCER)
+        self.transfer_backend = backend
+
+    def init_transfer_backend(self, transfer_config: Any = None) -> TransferBackend:
+        """Initialize the configured producer backend."""
+        transfer_config = transfer_config or self.config.transfer_config
+        if transfer_config is None:
+            raise ValueError("transfer_config must be provided")
+        backend = create_transfer_backend(transfer_config)
+        backend.setup(TransferRole.PRODUCER, self._producer_device())
+        self.transfer_backend = backend
+        if isinstance(backend, MooncakeTransferBackend):
+            self.mooncake_store = backend.store
+        return backend
 
     def setup(self) -> None:
         """Initialize target model and mooncake store."""
@@ -155,12 +191,34 @@ class HFRunner:
 
         self._setup_target_model()
         self._init_mooncake_store_if_configured()
+        if self.transfer_backend is not None:
+            # TransferBackend.setup is idempotent for an already-ready backend
+            # with the same role, while ensuring a caller-supplied NEW backend
+            # is ready before generate() reaches put().
+            self.transfer_backend.setup(TransferRole.PRODUCER, self._producer_device())
+        elif self.config.transfer_config is not None:
+            self.init_transfer_backend()
+        elif self.mooncake_store is not None:
+            backend = _PreinitializedMooncakeTransferBackend(self.mooncake_store)
+            backend.setup(TransferRole.PRODUCER)
+            self.transfer_backend = backend
         self._initialized = True
 
     def _init_mooncake_store_if_configured(self) -> None:
         """Initialize mooncake store if config is provided but store doesn't exist."""
-        if self.mooncake_store is None and self.config.mooncake_config is not None:
+        if (
+            self.transfer_backend is None
+            and self.mooncake_store is None
+            and self.config.mooncake_config is not None
+        ):
             self.init_mooncake_store()
+
+    @staticmethod
+    def _producer_device() -> int | None:
+        """Return the active CUDA device without probing it on CPU-only hosts."""
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.current_device()
 
     def _get_tp_rank(self) -> int:
         """Get tensor parallel rank from distributed context or environment."""
@@ -229,29 +287,25 @@ class HFRunner:
 
         results = []
         for i, sample in enumerate(inference_outputs):
-            if self.mooncake_store is not None:
+            if self.transfer_backend is not None:
                 key = str(uuid.uuid4())
-                store_meta = self.mooncake_store.put(
-                    key=key,
-                    hidden_states=sample["hidden_states"],
-                    target=sample["target"],
-                    input_ids=sample["input_ids"],
-                    last_hidden_states=sample["last_hidden_states"],
-                )
-
-                results.append(
-                    {
-                        "mooncake_key": key,
-                        "tensor_shapes": store_meta["shapes"],
-                        "tensor_dtypes": store_meta["dtypes"],
-                        "packed_loss_mask": packed_loss_mask_list[i],
-                    }
-                )
+                ref = self.transfer_backend.put(key, sample)
+                result = {
+                    "transfer_ref": ref.to_dict(),
+                    "packed_loss_mask": packed_loss_mask_list[i],
+                }
+                if ref.backend == "mooncake":
+                    result.update(
+                        mooncake_key=key,
+                        tensor_shapes={name: spec.shape for name, spec in ref.tensors.items()},
+                        tensor_dtypes={name: spec.dtype for name, spec in ref.tensors.items()},
+                    )
+                results.append(result)
             else:
                 results.append({"tensors": sample, "packed_loss_mask": packed_loss_mask_list[i]})
 
-        if self.mooncake_store is not None:
-            self.mooncake_store.flush()
+        if self.transfer_backend is not None:
+            self.transfer_backend.flush()
 
         return results
 
@@ -293,10 +347,14 @@ class HFRunner:
 
     def shutdown(self) -> None:
         """Clean up resources including mooncake store."""
-        if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
-            self.mooncake_store.close()
+        if self.transfer_backend is not None:
+            self.transfer_backend.close()
             tp_rank = self._get_tp_rank()
-            logger.info(f"[Rank {tp_rank}] EagleMooncakeStore closed")
+            logger.info(f"[Rank {tp_rank}] transfer backend closed")
+            self.transfer_backend = None
+            self.mooncake_store = None
+        elif self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
+            self.mooncake_store.close()
             self.mooncake_store = None
 
         if self.target_model is not None:

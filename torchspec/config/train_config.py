@@ -94,6 +94,14 @@ class ModelConfig:
 
 
 @dataclass
+class TransferConfig:
+    """Transfer backend selection and backend-specific options."""
+
+    backend: str = "mooncake"
+    options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class TrainingConfig:
     attention_backend: str = "sdpa"
     colocate: bool = False
@@ -187,6 +195,8 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     mooncake: dict[str, Any] = field(default_factory=dict)
+    transfer: TransferConfig = field(default_factory=TransferConfig)
+    uccl: dict[str, Any] = field(default_factory=dict)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -243,6 +253,18 @@ def _validate_vllm_config(config: DictConfig) -> None:
             raise NotImplementedError(f"{label} is not yet supported with the vllm backend!")
 
 
+def _validate_transfer_config(config: DictConfig) -> None:
+    backend = str(config.transfer.backend).lower()
+    if backend not in {"mooncake", "uccl", "uccl-p2p"}:
+        raise ValueError(f"Unknown transfer backend: {backend!r}")
+    if backend == "mooncake":
+        return
+    if config.model.target_model_backend == "vllm":
+        raise NotImplementedError("vLLM currently supports only the Mooncake transfer backend")
+    if config.training.attention_backend == "usp":
+        raise NotImplementedError("UCCL-P2P does not yet support USP-sharded transfers")
+
+
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -287,6 +309,7 @@ def load_config(
     _resolve_relative_paths(config, os.getcwd())
 
     _validate_vllm_config(config)
+    _validate_transfer_config(config)
 
     if save_snapshot:
         _save_config_snapshot(config)
@@ -299,6 +322,8 @@ _PREFIXED_SECTIONS = {
     "decode": "decode_",
     "mooncake": "mooncake_",
     "sglang": "sglang_",
+    "transfer": "transfer_",
+    "uccl": "uccl_",
     "vllm": "vllm_",
 }
 

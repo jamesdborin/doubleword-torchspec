@@ -44,17 +44,20 @@ torchspec/
 │   ├── trainer.py           #   Trainer (abstract base: device mesh, data fetcher, loop)
 │   ├── eagle3_trainer.py    #   Eagle3Trainer (model init, forward/backward, metrics)
 │   ├── fsdp.py              #   FSDP2 helpers (apply_fsdp2, fsdp2_load_full_state_dict)
-│   ├── data_fetcher.py      #   MooncakeDataFetcher
+│   ├── data_fetcher.py      #   TransferDataFetcher (Mooncake compatibility aliases)
 │   ├── checkpoint.py        #   Checkpoint save/load
 │   ├── optimizer.py         #   Optimizer construction (BF16Optimizer)
 │   └── lr_scheduler.py      #   LR scheduling
-├── transfer/                # Distributed tensor transfer
-│   └── mooncake/            #   Mooncake integration
-│       ├── store.py         #     MooncakeHiddenStateStore (base)
-│       ├── eagle_store.py   #     EagleMooncakeStore
-│       ├── buffers.py       #     HostBufferPool, GPUReceiveBuffer
-│       ├── helpers.py       #     Buffer size calculation
-│       └── utils.py         #     Mooncake utility helpers
+├── transfer/                # Backend-neutral distributed tensor transfer
+│   ├── base.py              #   TransferBackend and TransferRef contracts
+│   ├── factory.py           #   Lazy backend selection
+│   ├── mooncake/            #   Mooncake adapter and store
+│   │   ├── store.py         #     MooncakeHiddenStateStore (base)
+│   │   ├── eagle_store.py   #     EagleMooncakeStore
+│   │   ├── buffers.py       #     HostBufferPool, GPUReceiveBuffer
+│   │   ├── helpers.py       #     Buffer size calculation
+│   │   └── utils.py         #     Mooncake utility helpers
+│   └── uccl/                #   UCCL-P2P adapter and ACK/TTL lifetime handling
 ├── data/                    # Data pipeline
 │   ├── dataset.py           #   load_conversation_dataset()
 │   ├── parse.py             #   Chat format parsers (GeneralParser, etc.)
@@ -143,13 +146,19 @@ Factory function in `factory.py`: `create_inference_engines()`
 The training side is split across three layers:
 
 - **`trainer_actor.py`**: `TrainerActor` — the Ray actor. Owns the distributed process group (`dist.init_process_group`), holds a `Eagle3Trainer` instance, and exposes the remote API (`init`, `train_from_queue`, `save_model`, `set_vocab_buffers`, etc.)
-- **`trainer.py`**: `Trainer` — abstract base class. Sets up device mesh, `MooncakeDataFetcher`, checkpointing, profiling, and the training/eval loop skeleton
+- **`trainer.py`**: `Trainer` — abstract base class. Sets up device mesh, `TransferDataFetcher`, checkpointing, profiling, and the training/eval loop skeleton
 - **`eagle3_trainer.py`**: `Eagle3Trainer(Trainer)` — Eagle3-specific logic: initialises `Eagle3Model` with the draft model under FSDP2, runs the forward/backward, and aggregates metrics
 - **`fsdp.py`**: FSDP2 helpers (`apply_fsdp2`, `fsdp2_load_full_state_dict`, `init_empty_weights`)
 
-### 7. Mooncake Integration (`torchspec/transfer/mooncake/`)
+### 7. Transfer backends (`torchspec/transfer/`)
 
-Distributed tensor transfer for multi-node training:
+Inference and training exchange immutable `TransferRef` metadata through a
+`TransferBackend` interface. Mooncake remains the default and is wrapped by
+`MooncakeTransferBackend`; UCCL-P2P provides explicit peer-to-peer READs for
+CXI/Slingshot. See [transfer_backends.md](transfer_backends.md) for lifecycle,
+configuration, and current support boundaries.
+
+Mooncake-specific implementation details:
 
 - **`store.py`**: `MooncakeHiddenStateStore` - Base class with RDMA buffer management
 - **`eagle_store.py`**: `EagleMooncakeStore` - Eagle3-specific wrapper with:

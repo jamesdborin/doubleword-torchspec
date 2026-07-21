@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig, AutoEagle3DraftModel, Eagle3Model
+from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.models.eagle3 import compute_lazy_target_padded, compute_target_p_padded
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
@@ -66,7 +67,7 @@ class Eagle3Trainer(Trainer):
         target_model_path: str,
         mooncake_config=None,
     ) -> int:
-        if mooncake_config is not None:
+        if isinstance(mooncake_config, MooncakeConfig):
             from torchspec.transfer.mooncake.utils import (
                 check_mooncake_master_available,
             )

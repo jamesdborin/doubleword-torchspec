@@ -1,0 +1,90 @@
+model:
+  target_model_path: Qwen/Qwen3.5-9B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dflash_draft_config_qwen35_9b_ultrachat_magpie.json
+  target_model_backend: sglang
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+
+dataset:
+  train_data_path: repeated_conversation_40.jsonl
+  eval_data_path: null
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 16
+  num_proc: 1
+  shuffle_dataset: false
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.01
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 512
+  num_train_steps: 10
+  seed: 42
+  placement_strategy: custom
+  training_node_ips: null
+  training_num_gpus_per_node: 4
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 1
+  save_interval: 0
+  save_per_epoch: false
+  max_checkpoints: 0
+  warmup_ratio: 0.04
+  dflash_block_size: 8
+  dflash_num_anchors: 64
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 5
+  use_liger_kernel: true
+
+inference:
+  inference_engine_type: sgl
+  aux_hidden_states_layers: [2, 9, 16, 23, 30]
+  store_last_hidden_states: false
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 4
+  inference_node_ips: null
+  inference_fetch_batch: 1
+  inference_batch_size: 1
+  max_sample_pool_size: 4
+  inference_buffer_threshold: 4
+  sglang:
+    tp_size: 4
+    nnodes: 1
+    mem_fraction_static: 0.7
+    extra_args:
+      context_length: 520
+
+transfer:
+  backend: uccl-p2p
+
+uccl:
+  transport: cxi
+  use_gpu_direct: false
+  timeout_seconds: 180
+  poll_interval_seconds: 0.001
+  retention_ttl_seconds: 600
+  ack_bind_host: 0.0.0.0
+  ack_advertise_host: null
+
+logging:
+  report_to: tensorboard
+
+output_dir: ./outputs/uccl-tp4-fsdp4
+cache_dir: ./cache/uccl-tp4-fsdp4
+model_download_dir: null
+
+debug:
+  enable_perf_metrics: true
+  debug_train_only: false
+  debug_inference_only: false

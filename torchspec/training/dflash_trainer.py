@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.models.dflash import DFlashModel
 from torchspec.models.draft.dflash import DFlashDraftModel
 from torchspec.training import checkpoint
@@ -60,7 +61,7 @@ class DFlashTrainer(Trainer):
         target_model_path: str,
         mooncake_config=None,
     ) -> int:
-        if mooncake_config is not None:
+        if isinstance(mooncake_config, MooncakeConfig):
             from torchspec.transfer.mooncake.utils import (
                 check_mooncake_master_available,
             )

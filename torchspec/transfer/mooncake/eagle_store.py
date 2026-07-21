@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
+from torchspec.transfer.constants import HIDDEN_STATES_STORAGE_DTYPE
 from torchspec.transfer.mooncake.helpers import _format_bytes
 from torchspec.transfer.mooncake.store import MooncakeHiddenStateStore
 from torchspec.utils.distributed import get_usp_rank_coords
@@ -47,10 +48,6 @@ _DTYPE_ELEMENT_SIZES = {
     torch.uint8: 1,
     torch.bool: 1,
 }
-
-# Canonical dtype for hidden-state tensors written to / read from Mooncake.
-HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
-
 
 class EagleMooncakeStore(MooncakeHiddenStateStore):
     """

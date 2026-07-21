@@ -23,6 +23,7 @@ from torchspec.controller.loop import run_training_loop
 from torchspec.controller.setup import (
     auto_calculate_training_steps,
     build_mooncake_config,
+    build_transfer_config,
     setup_async_training_with_engines,
 )
 from torchspec.controller.training_controller import AsyncTrainingController
@@ -31,6 +32,7 @@ __all__ = [
     "AsyncTrainingController",
     "AsyncInferenceManager",
     "build_mooncake_config",
+    "build_transfer_config",
     "setup_async_training_with_engines",
     "auto_calculate_training_steps",
     "run_training_loop",

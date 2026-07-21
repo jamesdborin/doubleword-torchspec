@@ -31,6 +31,7 @@ from typing import Any
 import ray
 import torch
 
+from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
@@ -78,7 +79,7 @@ class HFEngine(InferenceEngine, RayActor):
 
         self._mooncake_config = mooncake_config
 
-        if mooncake_config is not None:
+        if isinstance(mooncake_config, MooncakeConfig):
             from torchspec.transfer.mooncake.utils import (
                 check_mooncake_master_available,
             )
@@ -93,6 +94,7 @@ class HFEngine(InferenceEngine, RayActor):
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
             aux_hidden_states_layers=getattr(self.args, "aux_hidden_states_layers", None),
             mooncake_config=mooncake_config,
+            transfer_config=mooncake_config,
         )
 
         logger.info(f"HFEngine rank {self.rank}: initialized from {self.args.target_model_path}")
